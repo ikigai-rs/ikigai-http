@@ -279,7 +279,7 @@ impl Endpoint for HttpEndpoint {
             .send(HttpRequest {
                 method: self.method,
                 url: url_str.to_string(),
-                headers: Vec::new(),
+                headers: request_headers(inv),
                 body,
             })
             .await
@@ -323,10 +323,15 @@ impl Endpoint for HttpEndpoint {
             .summary("Dereference a URL as a resource through a host transport, capability-gated by `urn:cap:net`.")
             .verb(self.method.verb())
             .output("application/octet-stream")
-            .input(ArgSpec::new("url").summary("the absolute URL to request"));
+            .input(ArgSpec::new("url").summary("the absolute URL to request"))
+            .input(ArgSpec::new("accept").summary("value for the Accept header"))
+            .input(ArgSpec::new("authorization").summary("value for the Authorization header"))
+            .input(ArgSpec::new("range").summary("value for the Range header, e.g. bytes=0-1023"))
+            .input(ArgSpec::new("headers").summary("extra request headers, one `Name: Value` per line"));
         if self.method.is_mutating() {
-            description =
-                description.input(ArgSpec::new("content").summary("the request body bytes"));
+            description = description
+                .input(ArgSpec::new("content").summary("the request body bytes"))
+                .input(ArgSpec::new("content_type").summary("value for the Content-Type header"));
         }
         description
     }
@@ -372,6 +377,36 @@ fn content_type(response: &HttpResponse) -> ReprType {
         Some(ct) => ReprType::new(ct.split(';').next().unwrap_or(ct).trim().to_string()),
         None => ReprType::new("application/octet-stream"),
     }
+}
+
+/// Build the request headers from the invocation's arguments: a generic
+/// `headers=` block (one `Name: Value` per line) plus convenience args that map to
+/// common headers (`accept`, `authorization`, `range`, `content_type`). All are
+/// optional; an absent arg contributes nothing. The convenience args are appended
+/// after the generic block, so an explicit `accept=` wins over one in `headers=`.
+fn request_headers(inv: &Invocation<'_>) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    if let Ok(block) = inv.inline_str("headers") {
+        for line in block.lines() {
+            if let Some((name, value)) = line.split_once(':') {
+                let (name, value) = (name.trim(), value.trim());
+                if !name.is_empty() {
+                    headers.push((name.to_string(), value.to_string()));
+                }
+            }
+        }
+    }
+    for (arg, header) in [
+        ("accept", "Accept"),
+        ("authorization", "Authorization"),
+        ("range", "Range"),
+        ("content_type", "Content-Type"),
+    ] {
+        if let Ok(value) = inv.inline_str(arg) {
+            headers.push((header.to_string(), value.to_string()));
+        }
+    }
+    headers
 }
 
 /// The freshness window in seconds from a `Cache-Control: max-age=N`, or `None`
@@ -560,5 +595,34 @@ mod tests {
         // The cached GET is now invalid even though its deadline hasn't passed.
         futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
         assert_eq!(transport.gets(), 2, "GET recomputed after the mutating cut");
+    }
+
+    /// A transport that records the headers of the last request it received.
+    struct Capture(std::sync::Mutex<Vec<(String, String)>>);
+    #[async_trait]
+    impl HttpTransport for Capture {
+        async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            *self.0.lock().unwrap() = request.headers.clone();
+            Ok(resp(None))
+        }
+    }
+
+    #[test]
+    fn args_become_request_headers() {
+        let transport = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let kernel = Kernel::new(Arc::new(space(transport.clone())));
+        let cap = Capability::root();
+        let req = Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+            .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()))
+            .with_arg("accept", ArgRef::Inline(b"application/json".to_vec()))
+            .with_arg("range", ArgRef::Inline(b"bytes=0-1023".to_vec()))
+            .with_arg("headers", ArgRef::Inline(b"X-Foo: bar\nX-Empty:".to_vec()));
+        futures::executor::block_on(kernel.issue(req, &cap)).unwrap();
+
+        let sent = transport.0.lock().unwrap().clone();
+        assert!(sent.contains(&("Accept".to_string(), "application/json".to_string())));
+        assert!(sent.contains(&("Range".to_string(), "bytes=0-1023".to_string())));
+        assert!(sent.contains(&("X-Foo".to_string(), "bar".to_string())));
+        assert!(sent.contains(&("X-Empty".to_string(), String::new())));
     }
 }

@@ -23,7 +23,9 @@ the method — so "is this cached?" falls straight out of the verb:
 | `delete` | `urn:httpDelete` | DELETE | no        |
 
 The URL is an argument (`url=`), so one binding serves every URL and the cache keys
-on the URL.
+on the URL. Optional args set request headers: `accept`, `authorization`, `range`,
+and a generic `headers=` block (one `Name: Value` per line); mutating methods also
+take `content=` (the body) and `content_type=`.
 
 ## Capabilities
 

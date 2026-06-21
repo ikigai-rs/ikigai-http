@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-http"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Outbound HTTP-client ikigai module: one endpoint per method (urn:httpGet…urn:httpDelete) with the ROC verb mirroring HTTP idempotency, a urn:cap:net host/path-ACL, golden-thread + time-based caching. A cfg-gated backend links into native and wasm32 hosts from one crate."
