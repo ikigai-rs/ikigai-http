@@ -58,7 +58,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgRef, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri, ReprType,
+    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri, ReprType,
     Representation, Request, Result, Verb,
 };
 use url::Url;
@@ -318,11 +318,17 @@ impl Endpoint for HttpEndpoint {
     }
 
     fn describe(&self) -> Description {
-        Description::new("http")
+        let mut description = Description::new("http")
             .title(format!("HTTP {}", self.method.as_str()))
             .summary("Dereference a URL as a resource through a host transport, capability-gated by `urn:cap:net`.")
             .verb(self.method.verb())
             .output("application/octet-stream")
+            .input(ArgSpec::new("url").summary("the absolute URL to request"));
+        if self.method.is_mutating() {
+            description =
+                description.input(ArgSpec::new("content").summary("the request body bytes"));
+        }
+        description
     }
 }
 
