@@ -1,0 +1,28 @@
+[package]
+name = "ikigai-http"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Outbound HTTP-client ikigai module: one endpoint per method (urn:httpGet…urn:httpDelete) with the ROC verb mirroring HTTP idempotency, a urn:cap:net host/path-ACL, golden-thread + time-based caching. A cfg-gated backend links into native and wasm32 hosts from one crate."
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+repository = "https://github.com/ikigai-rs/ikigai-http"
+homepage = "https://github.com/ikigai-rs/ikigai-http"
+readme = "README.md"
+keywords = ["ikigai", "roc", "resolution", "module", "http"]
+categories = ["web-programming::http-client", "wasm"]
+
+[dependencies]
+# The released kernel, consumed from crates.io — the SAME version the hosts use,
+# so a host links exactly one `ikigai-core`. 0.1.12 carries the time-cache surface
+# this module needs: `Expiry::At` / `Representation::cacheable_until`, the injected
+# `Clock`, and `Invocation::now`.
+#
+# DEV: a gitignored `.cargo/config.toml` redirects this to the local core checkout
+# until 0.1.12 is published+indexed; remove it once `cargo` can resolve 0.1.12.
+ikigai-core = "0.1.12"
+async-trait = "0.1"
+# URL parsing (host/path extraction for the capability ACL); runtime-free.
+url = "2"
+
+[dev-dependencies]
+futures = "0.3"
