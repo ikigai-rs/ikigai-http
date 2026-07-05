@@ -19,7 +19,7 @@ categories = ["web-programming::http-client", "wasm"]
 #
 # DEV: a gitignored `.cargo/config.toml` redirects this to the local core checkout
 # until 0.1.12 is published+indexed; remove it once `cargo` can resolve 0.1.12.
-ikigai-core = "0.1.12"
+ikigai-core = "0.1.35" # Description::requires + ActionSpec era
 async-trait = "0.1"
 # URL parsing (host/path extraction for the capability ACL); runtime-free.
 url = "2"
