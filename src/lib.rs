@@ -322,6 +322,10 @@ impl Endpoint for HttpEndpoint {
             .title(format!("HTTP {}", self.method.as_str()))
             .summary("Dereference a URL as a resource through a host transport, capability-gated by `urn:cap:net`.")
             .verb(self.method.verb())
+            // The net ACL is parameterized (urn:cap:net:<host-rule>): the wildcard
+            // offers this action to any capability holding SOME net grant; the
+            // actual host/path is checked against the rules at invoke time.
+            .requires("urn:cap:net:*")
             .output("application/octet-stream")
             .input(ArgSpec::new("url").summary("the absolute URL to request"))
             .input(ArgSpec::new("accept").summary("value for the Accept header"))
