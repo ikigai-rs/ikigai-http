@@ -111,6 +111,20 @@ impl Method {
         }
     }
 
+    /// The endpoint's description id — UNIQUE per method, so the catalog subject
+    /// (`urn:ikigai:endpoint:{id}`) and any projection keyed on it (e.g. an MCP
+    /// tool name) don't collide across the six method endpoints.
+    pub fn id(self) -> &'static str {
+        match self {
+            Method::Get => "httpGet",
+            Method::Head => "httpHead",
+            Method::Post => "httpPost",
+            Method::Put => "httpPut",
+            Method::Patch => "httpPatch",
+            Method::Delete => "httpDelete",
+        }
+    }
+
     /// Whether resolving this method may be served from cache (idempotent reads).
     pub fn is_cacheable(self) -> bool {
         self.verb().is_cacheable()
@@ -314,11 +328,11 @@ impl Endpoint for HttpEndpoint {
     }
 
     fn name(&self) -> &str {
-        "http"
+        self.method.id()
     }
 
     fn describe(&self) -> Description {
-        let mut description = Description::new("http")
+        let mut description = Description::new(self.method.id())
             .title(format!("HTTP {}", self.method.as_str()))
             .summary("Dereference a URL as a resource through a host transport, capability-gated by `urn:cap:net`.")
             .verb(self.method.verb())
@@ -432,6 +446,27 @@ mod tests {
     use super::*;
     use ikigai_core::{Capability, Clock, Kernel, Time};
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    #[test]
+    fn method_ids_are_unique() {
+        // The catalog subject + any projection keyed on the description id (an
+        // MCP tool name) must not collide across the six method endpoints.
+        let ids: Vec<&str> = [
+            Method::Get,
+            Method::Head,
+            Method::Post,
+            Method::Put,
+            Method::Patch,
+            Method::Delete,
+        ]
+        .iter()
+        .map(|m| m.id())
+        .collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "method ids collide: {ids:?}");
+    }
 
     #[test]
     fn method_verb_and_cacheability_track_idempotency() {
