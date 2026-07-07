@@ -269,7 +269,11 @@ impl Endpoint for HttpEndpoint {
 
         // Capability gate: the session must be granted this host (and path).
         if !net_allows(inv.capability, host, parsed.path()) {
-            return Err(Error::Endpoint(format!(
+            // Typed `Denied` — a permanent authority failure the trace, manifold,
+            // and wire recognize as a 403-equivalent without sniffing message text.
+            // (Network/transport failures below stay `Endpoint`: those are
+            // execution/upstream faults, not authorization denials.)
+            return Err(Error::Denied(format!(
                 "capability does not grant `{}` to `{host}{}`",
                 self.method.as_str(),
                 parsed.path()
@@ -593,6 +597,24 @@ mod tests {
             r.is_err(),
             "an ungranted host must be refused before any I/O"
         );
+    }
+
+    #[test]
+    fn ungranted_host_is_a_typed_denial_not_transient() {
+        // The gate is checked pre-flight (before any socket), so this is hermetic:
+        // a capability that grants only `other.com` can never reach `example.com`.
+        // The endpoint is invoked directly so we can assert the exact error variant.
+        let ep = HttpEndpoint::new(Method::Get, Arc::new(Mock::new(resp(None))));
+        let cap = Capability::root().attenuate(["urn:cap:net:other.com".to_string()]);
+        let req = Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+            .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()));
+        let bindings = ikigai_core::Bindings::new();
+        let inv = Invocation::detached(&req, &bindings, &cap);
+        let err = futures::executor::block_on(ep.invoke(&inv)).unwrap_err();
+        // A capability denial is the typed, permanent `Denied` — never a generic
+        // `Endpoint` string, and never transient (re-issuing won't change the answer).
+        assert!(matches!(err, Error::Denied(_)), "got {err:?}");
+        assert!(!err.is_transient());
     }
 
     #[test]
