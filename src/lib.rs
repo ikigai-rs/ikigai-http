@@ -45,14 +45,33 @@
 //! capability-gated — the agent gets "may call host X with credential Y", never the
 //! raw token — but that, and headers/body/range/auth args, land with the backend.
 //!
+//! ## Honest status (needs `ikigai-core` ≥ 0.1.47)
+//!
+//! The endpoint reports what HTTP said, mapped onto the typed-error taxonomy — it never hands
+//! back a `404` error page dressed up as the resource. It is **policy-free**: the caller decides
+//! what a status *means* for its purpose.
+//!
+//! - `GET`/`source` (and the mutating verbs): 2xx → the representation; 404/410 → `NotFound`;
+//!   401/403 → `Denied`; 408/504 → `Timeout`; 429/5xx → `Unavailable`; other 4xx → `Endpoint`.
+//!   A transport-level failure (DNS/refused/timeout) is `Unavailable`. Because the mapping lands
+//!   on the taxonomy, `is_transient` drives the retry/circuit-breaker/failover overlays for free.
+//! - `HEAD`/`exists`: a `"true"`/`"false"` text representation for a definitive presence answer
+//!   (present = 2xx/3xx/401/403/405; absent = 404/410), a typed error when the status is
+//!   indeterminate. This follows the `ikigai-fs` `Exists` convention (existence is an answer, not
+//!   an error).
+//!
 //! ## Caching (needs `ikigai-core` ≥ 0.1.12)
 //!
 //! A cacheable `GET`/`HEAD` is threaded on its URL (so a later `sink`/`delete` to
 //! the same URL cuts that thread and recomputes it — the write-invalidates-read
-//! half of the golden thread, applied to the web) and, when the response carries a
-//! `Cache-Control: max-age` / `Expires`, marked [`cacheable_until`] a deadline the
-//! kernel's injected [`Clock`] enforces. v1 is **lazy**: validity is checked on
-//! read; there is no proactive harvest thread (deferred).
+//! half of the golden thread, applied to the web) and marked [`cacheable_until`] a
+//! deadline the kernel's injected [`Clock`] enforces. The freshness window is the
+//! caller's `max_age=` directive (seconds) when given — so a liveness/existence
+//! check can cache a HEAD that carries no freshness of its own — else the response's
+//! `Cache-Control: max-age`; an explicit `no-store`/`no-cache` forbids caching
+//! either way. With no window (or no clock) a web read stays uncacheable, a live
+//! fact. v1 is **lazy**: validity is checked on read; there is no proactive harvest
+//! thread (deferred).
 
 use std::sync::Arc;
 
@@ -301,32 +320,45 @@ impl Endpoint for HttpEndpoint {
                 body,
             })
             .await
-            .map_err(|e| Error::Endpoint(format!("http transport: {e}")))?;
+            // A transport-level failure (DNS, connection refused, timeout, TLS) is a network
+            // fault → transient `Unavailable`, so Retry/CircuitBreaker/Failover overlays act on it.
+            .map_err(|e| Error::Unavailable(format!("http transport: {e}")))?;
 
-        // A mutating method invalidates any cached representation of the same URL,
-        // by cutting its thread through the kernel (so it works the same over the
-        // wire). Needs `urn:cap:kernel:cut` in the session — `root` has it.
+        // HEAD answers *existence*, per the `ikigai-fs` convention: a `"true"`/`"false"` text
+        // representation for a definitive presence answer, a typed error when the status doesn't
+        // speak to presence. No opinion about what's "dead" — the caller reads the honest signal.
+        if self.method == Method::Head {
+            let present = exists_outcome(response.status)?;
+            let window = freshness_window(&response, inv);
+            let repr = Representation::new(
+                ReprType::new("text/plain"),
+                if present {
+                    b"true".to_vec()
+                } else {
+                    b"false".to_vec()
+                },
+            );
+            return Ok(with_freshness(repr, window, inv, &thread));
+        }
+
+        // Every other method returns a representation on success and a **typed error** on a
+        // non-success status — never the error-page body dressed up as the resource.
+        source_outcome(response.status)?;
+
+        // A *successful* mutating method invalidates any cached representation of the same URL by
+        // cutting its thread through the kernel (so it works the same over the wire; needs
+        // `urn:cap:kernel:cut`, which `root` has). On an error status we returned above without
+        // cutting — a failed write leaves the cached read valid.
         if self.method.is_mutating() {
             let cut = Request::new(Verb::Sink, kernel_cut_iri())
                 .with_arg("thread", ArgRef::Inline(thread.clone().into_bytes()));
             inv.issue(cut).await?;
         }
 
-        // Read the response's cache headers before its body is moved into the repr.
-        let repr_type = content_type(&response);
-        let max_age = max_age_secs(&response);
-        let mut repr = Representation::new(repr_type, response.body);
-
-        // Cacheable reads: thread on the URL, and honour an explicit freshness
-        // window (`Cache-Control: max-age`) as a deadline. With no freshness signal
-        // — or no clock to measure one — a web read stays uncacheable (a live fact)
-        // rather than risk being cached permanently.
+        let window = freshness_window(&response, inv);
+        let repr = Representation::new(content_type(&response), response.body);
         if self.method.is_cacheable() {
-            if let (Some(max_age), Some(now)) = (max_age, inv.now()) {
-                repr = repr
-                    .cacheable_until(now.plus_millis(max_age.saturating_mul(1000)))
-                    .depends_on(thread);
-            }
+            return Ok(with_freshness(repr, window, inv, &thread));
         }
         Ok(repr)
     }
@@ -350,6 +382,13 @@ impl Endpoint for HttpEndpoint {
             .input(ArgSpec::new("authorization").summary("value for the Authorization header"))
             .input(ArgSpec::new("range").summary("value for the Range header, e.g. bytes=0-1023"))
             .input(ArgSpec::new("headers").summary("extra request headers, one `Name: Value` per line"));
+        if self.method.is_cacheable() {
+            description = description.input(ArgSpec::new("max_age").summary(
+                "cache this read for up to N seconds when a stale answer is acceptable (e.g. a \
+                 liveness/existence check); takes precedence over the response's own freshness, \
+                 except an explicit no-store",
+            ));
+        }
         if self.method.is_mutating() {
             description = description
                 .input(ArgSpec::new("content").summary("the request body bytes"))
@@ -431,13 +470,86 @@ fn request_headers(inv: &Invocation<'_>) -> Vec<(String, String)> {
     headers
 }
 
-/// The freshness window in seconds from a `Cache-Control: max-age=N`, or `None`
-/// when absent or when caching is forbidden (`no-store` / `no-cache`).
-fn max_age_secs(response: &HttpResponse) -> Option<u64> {
-    let cc = response.header("cache-control")?.to_ascii_lowercase();
-    if cc.contains("no-store") || cc.contains("no-cache") {
+/// The ROC outcome for a representation-returning resolve from an HTTP status: `Ok(())` on a
+/// success (2xx, or a 3xx the transport didn't follow), else a **typed error** mapped onto the
+/// taxonomy so `is_transient` drives the retry/circuit-breaker overlays correctly. The module is
+/// policy-free — it reports what HTTP said; the caller decides what it means.
+fn source_outcome(status: u16) -> Result<()> {
+    match status {
+        200..=399 => Ok(()),
+        404 | 410 => Err(Error::NotFound(format!("HTTP {status}"))),
+        401 | 403 => Err(Error::Denied(format!("HTTP {status}"))),
+        408 | 504 => Err(Error::Timeout(format!("HTTP {status}"))),
+        429 => Err(Error::Unavailable(format!("HTTP {status}"))),
+        500..=599 => Err(Error::Unavailable(format!("HTTP {status}"))),
+        _ => Err(Error::Endpoint(format!("HTTP {status}"))),
+    }
+}
+
+/// The existence outcome for a HEAD from an HTTP status: **present** (`true`), **absent**
+/// (`false`), or a **typed error** when the status gives no definitive presence answer. A 401/403
+/// (there, gated) and a 405 (there, HEAD not allowed) are *present*; only 404/410 are *absent*.
+fn exists_outcome(status: u16) -> Result<bool> {
+    match status {
+        200..=399 => Ok(true),
+        401 | 403 | 405 => Ok(true),
+        404 | 410 => Ok(false),
+        408 | 504 => Err(Error::Timeout(format!("HTTP {status}"))),
+        429 => Err(Error::Unavailable(format!("HTTP {status}"))),
+        500..=599 => Err(Error::Unavailable(format!("HTTP {status}"))),
+        _ => Err(Error::Endpoint(format!(
+            "HTTP {status}: no definitive existence answer"
+        ))),
+    }
+}
+
+/// Apply the cache policy for a cacheable read: when a freshness window applies, mark the repr
+/// cacheable until that deadline **and** thread it on the URL (so a later write to the same URL
+/// cuts it). With no window — or no clock — the read stays uncacheable, a live fact.
+fn with_freshness(
+    repr: Representation,
+    window: Option<u64>,
+    inv: &Invocation<'_>,
+    thread: &str,
+) -> Representation {
+    match (window, inv.now()) {
+        (Some(secs), Some(now)) => repr
+            .cacheable_until(now.plus_millis(secs.saturating_mul(1000)))
+            .depends_on(thread.to_string()),
+        _ => repr,
+    }
+}
+
+/// The freshness window (seconds) for a cacheable read: the **caller's** `max_age` arg if given,
+/// else the response's `Cache-Control: max-age` — but an explicit `no-store`/`no-cache` forbids
+/// caching regardless (a strong origin directive wins over a caller's staleness tolerance). The
+/// caller directive is what lets a liveness/existence check cache a HEAD that carries no freshness
+/// of its own, instead of hitting the network every time.
+fn freshness_window(response: &HttpResponse, inv: &Invocation<'_>) -> Option<u64> {
+    if response_forbids_store(response) {
         return None;
     }
+    caller_max_age(inv).or_else(|| response_max_age(response))
+}
+
+/// The caller's `max_age` directive in seconds, if provided and parseable.
+fn caller_max_age(inv: &Invocation<'_>) -> Option<u64> {
+    inv.inline_str("max_age")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Whether the response forbids caching outright (`Cache-Control: no-store` / `no-cache`).
+fn response_forbids_store(response: &HttpResponse) -> bool {
+    response.header("cache-control").is_some_and(|cc| {
+        let cc = cc.to_ascii_lowercase();
+        cc.contains("no-store") || cc.contains("no-cache")
+    })
+}
+
+/// The response's own freshness window from `Cache-Control: max-age=N`, if present.
+fn response_max_age(response: &HttpResponse) -> Option<u64> {
+    let cc = response.header("cache-control")?.to_ascii_lowercase();
     cc.split(',').find_map(|d| {
         d.trim()
             .strip_prefix("max-age=")
@@ -685,5 +797,170 @@ mod tests {
         assert!(sent.contains(&("Range".to_string(), "bytes=0-1023".to_string())));
         assert!(sent.contains(&("X-Foo".to_string(), "bar".to_string())));
         assert!(sent.contains(&("X-Empty".to_string(), String::new())));
+    }
+
+    // --- honest status + the caller freshness directive --------------------
+
+    /// A transport that returns a chosen status (+ optional `Cache-Control`), counting sends.
+    struct Status {
+        code: u16,
+        cc: Option<&'static str>,
+        sends: AtomicU32,
+    }
+    impl Status {
+        fn new(code: u16, cc: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Status {
+                code,
+                cc,
+                sends: AtomicU32::new(0),
+            })
+        }
+        fn sends(&self) -> u32 {
+            self.sends.load(Ordering::SeqCst)
+        }
+    }
+    #[async_trait]
+    impl HttpTransport for Status {
+        async fn send(&self, _req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            let mut headers = vec![("content-type".to_string(), "text/plain".to_string())];
+            if let Some(cc) = self.cc {
+                headers.push(("cache-control".to_string(), cc.to_string()));
+            }
+            Ok(HttpResponse {
+                status: self.code,
+                headers,
+                body: b"body".to_vec(),
+            })
+        }
+    }
+
+    fn get_result(status: u16) -> Result<Representation> {
+        let kernel = Kernel::new(Arc::new(space(Status::new(status, None))));
+        futures::executor::block_on(kernel.issue(get("https://example.com/x"), &Capability::root()))
+    }
+
+    fn head_body(status: u16) -> Result<String> {
+        let kernel = Kernel::new(Arc::new(space(Status::new(status, None))));
+        let req = Request::new(Verb::Exists, Iri::parse("urn:httpHead").unwrap())
+            .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()));
+        futures::executor::block_on(kernel.issue(req, &Capability::root()))
+            .map(|r| String::from_utf8(r.bytes).unwrap())
+    }
+
+    #[test]
+    fn get_maps_status_onto_the_typed_error_taxonomy() {
+        assert!(get_result(200).is_ok(), "2xx is a representation");
+        assert!(matches!(get_result(404).unwrap_err(), Error::NotFound(_)));
+        assert!(matches!(get_result(410).unwrap_err(), Error::NotFound(_)));
+        assert!(matches!(get_result(401).unwrap_err(), Error::Denied(_)));
+        assert!(matches!(get_result(403).unwrap_err(), Error::Denied(_)));
+        assert!(matches!(get_result(504).unwrap_err(), Error::Timeout(_)));
+        // 429 and 5xx are transient — the retry overlays should act on them.
+        let e503 = get_result(503).unwrap_err();
+        assert!(matches!(e503, Error::Unavailable(_)) && e503.is_transient());
+        assert!(matches!(
+            get_result(500).unwrap_err(),
+            Error::Unavailable(_)
+        ));
+        assert!(matches!(
+            get_result(429).unwrap_err(),
+            Error::Unavailable(_)
+        ));
+        // A permanent client error we don't type specifically → Endpoint.
+        let e422 = get_result(422).unwrap_err();
+        assert!(matches!(e422, Error::Endpoint(_)) && !e422.is_transient());
+    }
+
+    #[test]
+    fn head_reports_existence_true_false_or_a_typed_error() {
+        assert_eq!(head_body(200).unwrap(), "true");
+        assert_eq!(head_body(301).unwrap(), "true");
+        assert_eq!(head_body(403).unwrap(), "true", "present, just gated");
+        assert_eq!(head_body(405).unwrap(), "true", "present, HEAD not allowed");
+        assert_eq!(head_body(404).unwrap(), "false");
+        assert_eq!(head_body(410).unwrap(), "false");
+        // Indeterminate → a typed transient error, not a bogus boolean.
+        assert!(matches!(head_body(503).unwrap_err(), Error::Unavailable(_)));
+    }
+
+    #[test]
+    fn a_transport_failure_is_a_transient_unavailable() {
+        struct Boom;
+        #[async_trait]
+        impl HttpTransport for Boom {
+            async fn send(&self, _r: HttpRequest) -> std::result::Result<HttpResponse, String> {
+                Err("connection refused".into())
+            }
+        }
+        let kernel = Kernel::new(Arc::new(space(Arc::new(Boom))));
+        let err = futures::executor::block_on(
+            kernel.issue(get("https://example.com/x"), &Capability::root()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Unavailable(_)) && err.is_transient());
+    }
+
+    /// A GET carrying a `max_age` directive, resolved repeatedly.
+    fn max_age_get() -> Request {
+        Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+            .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()))
+            .with_arg("max_age", ArgRef::Inline(b"3600".to_vec()))
+    }
+
+    #[test]
+    fn a_caller_max_age_caches_a_response_that_carries_no_freshness() {
+        let transport = Status::new(200, None); // origin says nothing about caching
+        let clock = TestClock::at(0);
+        let kernel =
+            Kernel::new(Arc::new(space(transport.clone()))).with_clock(Arc::new(clock.clone()));
+        let cap = Capability::root();
+        futures::executor::block_on(kernel.issue(max_age_get(), &cap)).unwrap();
+        futures::executor::block_on(kernel.issue(max_age_get(), &cap)).unwrap();
+        assert_eq!(
+            transport.sends(),
+            1,
+            "the caller directive makes an otherwise-uncacheable read cacheable"
+        );
+        clock.set(3_601_000);
+        futures::executor::block_on(kernel.issue(max_age_get(), &cap)).unwrap();
+        assert_eq!(
+            transport.sends(),
+            2,
+            "refetched after the caller window elapsed"
+        );
+    }
+
+    #[test]
+    fn a_caller_max_age_overrides_a_shorter_response_max_age() {
+        let transport = Status::new(200, Some("max-age=60"));
+        let clock = TestClock::at(0);
+        let kernel =
+            Kernel::new(Arc::new(space(transport.clone()))).with_clock(Arc::new(clock.clone()));
+        let cap = Capability::root();
+        futures::executor::block_on(kernel.issue(max_age_get(), &cap)).unwrap();
+        clock.set(61_000); // past the origin's 60s, well within the caller's hour
+        futures::executor::block_on(kernel.issue(max_age_get(), &cap)).unwrap();
+        assert_eq!(
+            transport.sends(),
+            1,
+            "the caller window takes precedence over the shorter response max-age"
+        );
+    }
+
+    #[test]
+    fn no_store_forbids_caching_even_with_a_caller_max_age() {
+        let transport = Status::new(200, Some("no-store"));
+        let clock = TestClock::at(0);
+        let kernel =
+            Kernel::new(Arc::new(space(transport.clone()))).with_clock(Arc::new(clock.clone()));
+        let cap = Capability::root();
+        futures::executor::block_on(kernel.issue(max_age_get(), &cap)).unwrap();
+        futures::executor::block_on(kernel.issue(max_age_get(), &cap)).unwrap();
+        assert_eq!(
+            transport.sends(),
+            2,
+            "an explicit no-store beats the caller's staleness tolerance"
+        );
     }
 }
