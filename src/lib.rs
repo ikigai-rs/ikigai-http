@@ -55,10 +55,15 @@
 //!   401/403 → `Denied`; 408/504 → `Timeout`; 429/5xx → `Unavailable`; other 4xx → `Endpoint`.
 //!   A transport-level failure (DNS/refused/timeout) is `Unavailable`. Because the mapping lands
 //!   on the taxonomy, `is_transient` drives the retry/circuit-breaker/failover overlays for free.
-//! - `HEAD`/`exists`: a `"true"`/`"false"` text representation for a definitive presence answer
-//!   (present = 2xx/3xx/401/403/405; absent = 404/410), a typed error when the status is
-//!   indeterminate. This follows the `ikigai-fs` `Exists` convention (existence is an answer, not
-//!   an error).
+//! - `HEAD`/`exists`: a `"true"`/`"false"` text representation, following the `ikigai-fs` `Exists`
+//!   convention (existence is an answer, not an error). Existence is **lenient**: the check is only
+//!   reached once the server has answered, so any status but 404/410 means the host is reachable and
+//!   the endpoint is *present* (`true`) — a 429 throttle, a 5xx error, a 408/504 timeout all count
+//!   as there-but-busy. Only 404/410 is *absent* (`false`); only a transport failure (which errors
+//!   before the status is seen) is unreachable. This is deliberately more lenient than `Source`:
+//!   `Exists` asks "is it there?", `Source` asks "give it to me" (where a 429/5xx is an honest
+//!   transient error). A link-checker leans on the split — a bookmark whose host answers `429`/`503`
+//!   is not dead.
 //!
 //! ## Caching (needs `ikigai-core` ≥ 0.1.12)
 //!
@@ -328,7 +333,7 @@ impl Endpoint for HttpEndpoint {
         // representation for a definitive presence answer, a typed error when the status doesn't
         // speak to presence. No opinion about what's "dead" — the caller reads the honest signal.
         if self.method == Method::Head {
-            let present = exists_outcome(response.status)?;
+            let present = exists_outcome(response.status);
             let window = freshness_window(&response, inv);
             let repr = Representation::new(
                 ReprType::new("text/plain"),
@@ -486,21 +491,20 @@ fn source_outcome(status: u16) -> Result<()> {
     }
 }
 
-/// The existence outcome for a HEAD from an HTTP status: **present** (`true`), **absent**
-/// (`false`), or a **typed error** when the status gives no definitive presence answer. A 401/403
-/// (there, gated) and a 405 (there, HEAD not allowed) are *present*; only 404/410 are *absent*.
-fn exists_outcome(status: u16) -> Result<bool> {
-    match status {
-        200..=399 => Ok(true),
-        401 | 403 | 405 => Ok(true),
-        404 | 410 => Ok(false),
-        408 | 504 => Err(Error::Timeout(format!("HTTP {status}"))),
-        429 => Err(Error::Unavailable(format!("HTTP {status}"))),
-        500..=599 => Err(Error::Unavailable(format!("HTTP {status}"))),
-        _ => Err(Error::Endpoint(format!(
-            "HTTP {status}: no definitive existence answer"
-        ))),
-    }
+/// The existence outcome for a HEAD from an HTTP status. `exists_outcome` is only reached once the
+/// server has **answered** (a transport failure errors before this), so any status it sees is proof
+/// the host is reachable. Existence is therefore lenient: **only 404/410 are *absent*** (`false`);
+/// every other answer — including a 429 throttle, a 5xx server error, or a 408/504 timeout — means
+/// the endpoint is *there*, just busy or gated, and is *present* (`true`).
+///
+/// This is deliberately more lenient than `source_outcome`: `Exists` asks "is it there?" and a
+/// server that responds at all answers yes (bar a definitive gone); `Source` asks "give it to me"
+/// and a 429/5xx is a real, honestly-typed transient failure. The split matters for callers like a
+/// link-checker: a bookmark whose host answers `429`/`503` (rate-limited or briefly down, e.g.
+/// behind a Cloudflare bot-wall) is **not a dead link** — only an unresolvable host is unreachable,
+/// and only a 404/410 is gone.
+fn exists_outcome(status: u16) -> bool {
+    !matches!(status, 404 | 410)
 }
 
 /// Apply the cache policy for a cacheable read: when a freshness window applies, mark the repr
@@ -873,15 +877,23 @@ mod tests {
     }
 
     #[test]
-    fn head_reports_existence_true_false_or_a_typed_error() {
+    fn head_existence_is_lenient_only_404_410_are_absent() {
         assert_eq!(head_body(200).unwrap(), "true");
         assert_eq!(head_body(301).unwrap(), "true");
         assert_eq!(head_body(403).unwrap(), "true", "present, just gated");
         assert_eq!(head_body(405).unwrap(), "true", "present, HEAD not allowed");
         assert_eq!(head_body(404).unwrap(), "false");
         assert_eq!(head_body(410).unwrap(), "false");
-        // Indeterminate → a typed transient error, not a bogus boolean.
-        assert!(matches!(head_body(503).unwrap_err(), Error::Unavailable(_)));
+        // The server *answered*, so the host is reachable — busy/erroring is still present, NOT a
+        // dead link. Only a transport failure (tested separately) is unreachable.
+        assert_eq!(head_body(429).unwrap(), "true", "throttled, but there");
+        assert_eq!(head_body(503).unwrap(), "true", "briefly down, but there");
+        assert_eq!(head_body(500).unwrap(), "true", "erroring, but there");
+        assert_eq!(
+            head_body(504).unwrap(),
+            "true",
+            "gateway timeout, but reachable"
+        );
     }
 
     #[test]
