@@ -28,18 +28,35 @@
 //! ## The capability ACL
 //!
 //! A network capability is carried as `urn:cap:` scopes of the form
-//! `urn:cap:net:<host>[/<path-prefix>]`. A leading `-` marks a **deny**:
+//! `urn:cap:net:<host>[:<port>][/<path-prefix>]`. A leading `-` marks a **deny**:
 //!
-//! - `urn:cap:net:example.com` — call any path on `example.com`.
+//! - `urn:cap:net:example.com` — call any path on `example.com`, any port.
+//! - `urn:cap:net:example.com:8443` — only port 8443 on that host.
 //! - `urn:cap:net:example.com/api` — only paths under `/api`.
 //! - `urn:cap:net:example.com` **+** `urn:cap:net:-example.com/admin` — the host
 //!   except `/admin`.
 //!
 //! Matching is **longest-prefix wins**, **deny breaks ties**, segment-aware (so
-//! `/api` does not match `/apixyz`); no matching rule → **default-deny**. A `root`
-//! capability allows everything. (Per the locked design the scope is host/path
-//! only — not per-method; an agent is trusted with a host, not with a verb. A
-//! finer `urn:cap:net:<method>:…` form is a possible later refinement.)
+//! `/api` does not match `/apixyz`); no matching rule → **default-deny**. A rule
+//! without a port matches any port; a rule with a port matches exactly that port
+//! (an IPv6 host in a rule uses brackets: `urn:cap:net:[::1]:8080`). A bare
+//! `urn:cap:net:` scope (no host) grants **nothing** — there is no wildcard-allow
+//! rule; breadth is granted host by host. A `root` capability allows everything.
+//! (Per the locked design the scope is host/path only — not per-method; an agent
+//! is trusted with a host, not with a verb. A finer `urn:cap:net:<method>:…` form
+//! is a possible later refinement.)
+//!
+//! ## Redirects
+//!
+//! The **endpoint** owns redirect-following; a host transport must return 3xx
+//! responses as-is and never follow them itself (an auto-following transport
+//! would let a granted host 302 the request to an ungranted one — the classic
+//! SSRF-via-redirect). For cacheable methods (`GET`/`HEAD`) the endpoint follows
+//! up to 5 hops, re-running the capability ACL against **each** hop's host, port
+//! and path — a redirect to an ungranted authority is a typed `Denied`. Mutating
+//! methods never follow a redirect (no cross-host replay of a request body): a
+//! 3xx with a `Location` on `POST`/`PUT`/`PATCH`/`DELETE` is a typed error
+//! naming the target instead.
 //!
 //! The credential to authenticate with (when one is needed) is itself meant to be
 //! capability-gated — the agent gets "may call host X with credential Y", never the
@@ -164,18 +181,35 @@ impl Method {
 }
 
 /// The capability path-ACL for outbound HTTP: does `capability` grant a request to
-/// `host` + `path`? Mirrors the file module's matcher but over a URL's authority
-/// and path. Scopes are `urn:cap:net:<host>[/<path-prefix>]`; a leading `-` denies.
-/// Longest matching rule wins, a deny breaks ties, no rule means deny, and a `root`
-/// capability allows everything.
+/// `host` + `path`, on any port? Mirrors the file module's matcher but over a URL's
+/// authority and path. Scopes are `urn:cap:net:<host>[:<port>][/<path-prefix>]`; a
+/// leading `-` denies. Longest matching rule wins, a deny breaks ties, no rule
+/// means deny, and a `root` capability allows everything.
+///
+/// This port-less form treats the target port as *unknown*, so port-scoped rules
+/// still match (a caller that can't know the port isn't judged on it). The HTTP
+/// endpoints themselves use [`net_allows_port`] with the URL's real port, where
+/// port-scoped rules are enforced exactly.
 pub fn net_allows(capability: &ikigai_core::Capability, host: &str, path: &str) -> bool {
+    net_allows_port(capability, host, None, path)
+}
+
+/// The port-aware capability ACL: like [`net_allows`], with the target port
+/// supplied (`None` = unknown, matches any rule port). A rule that names a port
+/// (`urn:cap:net:example.com:8443`) matches only that port; a rule without one
+/// matches every port on its host. A bare `urn:cap:net:` scope grants nothing.
+pub fn net_allows_port(
+    capability: &ikigai_core::Capability,
+    host: &str,
+    port: Option<u16>,
+    path: &str,
+) -> bool {
     if capability.is_root() {
         return true;
     }
     let Some(scopes) = capability.scopes() else {
         return false;
     };
-    let target = authority_key(host, path);
     let prefix = "urn:cap:net:";
 
     let mut best_len: Option<usize> = None;
@@ -184,12 +218,17 @@ pub fn net_allows(capability: &ikigai_core::Capability, host: &str, path: &str) 
         let Some(rest) = scope.strip_prefix(prefix) else {
             continue;
         };
-        // A leading `-` marks a deny rule; the remainder is the host[/path] rule.
+        // A leading `-` marks a deny rule; the remainder is the host[:port][/path] rule.
         let (rule_allows, rule) = match rest.strip_prefix('-') {
             Some(r) => (false, r),
             None => (true, rest),
         };
-        if !authority_within(rule, &target) {
+        // A bare `urn:cap:net:` (or `urn:cap:net:-`) contributes no rule: there is
+        // no wildcard-allow — an empty rule must not match every authority.
+        if rule.is_empty() {
+            continue;
+        }
+        if !rule_matches(rule, host, port, path) {
             continue;
         }
         let len = rule.len();
@@ -208,20 +247,37 @@ pub fn net_allows(capability: &ikigai_core::Capability, host: &str, path: &str) 
     best_len.is_some() && allowed
 }
 
-/// The `host/path` key a net rule is matched against: host followed by the URL
-/// path. (Both are split on `/` for segment-aware prefixing, so the exact joining
-/// punctuation is immaterial — only the segments matter.)
-fn authority_key(host: &str, path: &str) -> String {
-    format!("{host}/{}", path.trim_start_matches('/'))
-}
-
-/// Whether `rule` (a `host[/prefix]`) is a **segment prefix** of `target` (a
-/// `host/path`): same host, and the rule's path segments are a leading run of the
-/// target's — so `example.com/api` covers `/api/x` but not `/apixyz`. An empty
-/// rule (host-less `urn:cap:net:`) matches everything.
-fn authority_within(rule: &str, target: &str) -> bool {
-    let rule_segs: Vec<&str> = rule.split('/').filter(|s| !s.is_empty()).collect();
-    let target_segs: Vec<&str> = target.split('/').filter(|s| !s.is_empty()).collect();
+/// Whether one rule (`host[:port][/path-prefix]`) covers the target authority:
+/// host equal (case-insensitive), rule port — when present — equal to the target
+/// port (an unknown target port matches any rule port), and the rule's path
+/// segments a leading run of the target's — so `example.com/api` covers `/api/x`
+/// but not `/apixyz`. A bracketed IPv6 host (`[::1]:8080`) parses as
+/// host `[::1]`, port `8080` — the trailing-digits check keeps the address's own
+/// colons from being misread as a port.
+fn rule_matches(rule: &str, host: &str, port: Option<u16>, path: &str) -> bool {
+    let (rule_authority, rule_path) = match rule.split_once('/') {
+        Some((authority, path)) => (authority, path),
+        None => (rule, ""),
+    };
+    let (rule_host, rule_port) = match rule_authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            match p.parse::<u16>() {
+                Ok(n) => (h, Some(n)),
+                Err(_) => return false, // digits but out of range: matches nothing
+            }
+        }
+        _ => (rule_authority, None),
+    };
+    if !rule_host.eq_ignore_ascii_case(host) {
+        return false;
+    }
+    if let (Some(rule_port), Some(port)) = (rule_port, port) {
+        if rule_port != port {
+            return false;
+        }
+    }
+    let rule_segs: Vec<&str> = rule_path.split('/').filter(|s| !s.is_empty()).collect();
+    let target_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     rule_segs.len() <= target_segs.len() && rule_segs.iter().zip(&target_segs).all(|(r, t)| r == t)
 }
 
@@ -257,9 +313,16 @@ impl HttpResponse {
 /// browser host with `fetch`, a test with a canned map — so no HTTP client (and no
 /// Tokio) is baked into this crate. Async so a real client can await; boxed via
 /// `async-trait` so the executor is still chosen at the edge.
+///
+/// **Contract: a transport must NOT follow redirects.** A 3xx response is
+/// returned as-is; the endpoint follows it (for cacheable methods only), because
+/// only the endpoint can re-run the capability ACL against the redirect target —
+/// a transport that auto-follows lets a granted host forward the request to an
+/// ungranted one behind the capability's back.
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
     /// Perform `request`, returning the response or a transport-level error.
+    /// Redirects are not followed — a 3xx comes back as the response.
     async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String>;
 }
 
@@ -286,26 +349,10 @@ impl Endpoint for HttpEndpoint {
             name: "url".to_string(),
             detail: format!("not a URL: {e}"),
         })?;
-        let host = parsed.host_str().ok_or_else(|| Error::InvalidArgument {
-            name: "url".to_string(),
-            detail: "URL has no host".to_string(),
-        })?;
-
-        // Capability gate: the session must be granted this host (and path).
-        if !net_allows(inv.capability, host, parsed.path()) {
-            // Typed `Denied` — a permanent authority failure the trace, manifold,
-            // and wire recognize as a 403-equivalent without sniffing message text.
-            // (Network/transport failures below stay `Endpoint`: those are
-            // execution/upstream faults, not authorization denials.)
-            return Err(Error::Denied(format!(
-                "capability does not grant `{}` to `{host}{}`",
-                self.method.as_str(),
-                parsed.path()
-            )));
-        }
-
         // The golden thread for this URL (fragment stripped — not sent on the wire):
-        // a cacheable read depends on it; a mutating call cuts it.
+        // a cacheable read depends on it; a mutating call cuts it. The thread stays
+        // on the REQUESTED URL even when redirects are followed — the request
+        // identity (and so the cache key) is the URL the caller named.
         let thread = url_thread(&parsed);
 
         let body = if self.method.is_mutating() {
@@ -315,19 +362,78 @@ impl Endpoint for HttpEndpoint {
         } else {
             Vec::new()
         };
+        let headers = request_headers(inv);
 
-        let response = self
-            .transport
-            .send(HttpRequest {
-                method: self.method,
-                url: url_str.to_string(),
-                headers: request_headers(inv),
-                body,
-            })
-            .await
-            // A transport-level failure (DNS, connection refused, timeout, TLS) is a network
-            // fault → transient `Unavailable`, so Retry/CircuitBreaker/Failover overlays act on it.
-            .map_err(|e| Error::Unavailable(format!("http transport: {e}")))?;
+        // Follow redirects here — never in the transport — so the capability ACL
+        // runs against EVERY hop's authority, not just the first (the transport
+        // contract forbids auto-following for exactly this reason).
+        const MAX_REDIRECTS: usize = 5;
+        let mut current = parsed.clone();
+        let mut hops = 0usize;
+        let response = loop {
+            let host = current.host_str().ok_or_else(|| Error::InvalidArgument {
+                name: "url".to_string(),
+                detail: "URL has no host".to_string(),
+            })?;
+            // Capability gate, per hop: the session must be granted this host,
+            // port and path. Typed `Denied` — a permanent authority failure the
+            // trace, manifold, and wire recognize as a 403-equivalent without
+            // sniffing message text. (Network/transport failures below stay
+            // transient `Unavailable`: execution faults, not authorization.)
+            if !net_allows_port(
+                inv.capability,
+                host,
+                current.port_or_known_default(),
+                current.path(),
+            ) {
+                let via = if hops > 0 { "redirect target " } else { "" };
+                return Err(Error::Denied(format!(
+                    "capability does not grant `{}` to {via}`{host}{}`",
+                    self.method.as_str(),
+                    current.path()
+                )));
+            }
+
+            let response = self
+                .transport
+                .send(HttpRequest {
+                    method: self.method,
+                    url: current.to_string(),
+                    headers: headers.clone(),
+                    body: body.clone(),
+                })
+                .await
+                // A transport-level failure (DNS, connection refused, timeout, TLS) is a network
+                // fault → transient `Unavailable`, so Retry/CircuitBreaker/Failover overlays act on it.
+                .map_err(|e| Error::Unavailable(format!("http transport: {e}")))?;
+
+            if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+                break response;
+            }
+            let Some(location) = response.header("location") else {
+                break response; // a 3xx with nowhere to go is just a response
+            };
+            if self.method.is_mutating() {
+                // Never replay a request body at a redirect target — the target
+                // may be a different authority than the one the caller vetted.
+                return Err(Error::Endpoint(format!(
+                    "HTTP {} redirect on {} not followed (mutating methods never \
+                     follow redirects); Location: {location}",
+                    response.status,
+                    self.method.as_str()
+                )));
+            }
+            hops += 1;
+            if hops > MAX_REDIRECTS {
+                return Err(Error::Endpoint(format!(
+                    "too many redirects (limit {MAX_REDIRECTS}) at `{location}`"
+                )));
+            }
+            current = current.join(location).map_err(|e| {
+                Error::Endpoint(format!("invalid redirect Location `{location}`: {e}"))
+            })?;
+            current.set_fragment(None);
+        };
 
         // HEAD answers *existence*, per the `ikigai-fs` convention: a `"true"`/`"false"` text
         // representation for a definitive presence answer, a typed error when the status doesn't
@@ -640,6 +746,57 @@ mod tests {
     fn no_matching_rule_is_default_deny() {
         let cap = Capability::root().attenuate(["urn:cap:net:example.com".to_string()]);
         assert!(!net_allows(&cap, "other.com", "/x"));
+    }
+
+    #[test]
+    fn bare_net_scope_grants_nothing() {
+        // `urn:cap:net:` with no host used to be a wildcard-allow (an empty rule
+        // was a prefix of everything). It must grant nothing: breadth is granted
+        // host by host, never by an accidentally-empty rule.
+        let cap = Capability::root().attenuate(["urn:cap:net:".to_string()]);
+        assert!(!net_allows(&cap, "example.com", "/"));
+        assert!(!net_allows(&cap, "169.254.169.254", "/latest/meta-data"));
+        let deny_only = Capability::root().attenuate(["urn:cap:net:-".to_string()]);
+        assert!(!net_allows(&deny_only, "example.com", "/"));
+    }
+
+    #[test]
+    fn port_rule_matches_only_its_port() {
+        let cap = Capability::root().attenuate(["urn:cap:net:example.com:8443".to_string()]);
+        assert!(net_allows_port(&cap, "example.com", Some(8443), "/x"));
+        assert!(!net_allows_port(&cap, "example.com", Some(443), "/x"));
+        assert!(!net_allows_port(&cap, "example.com", Some(22), "/"));
+        // An unknown target port matches (the port-less `net_allows` callers
+        // aren't judged on a port they can't know).
+        assert!(net_allows(&cap, "example.com", "/x"));
+        // A port-less rule matches every port on its host.
+        let any = Capability::root().attenuate(["urn:cap:net:example.com".to_string()]);
+        assert!(net_allows_port(&any, "example.com", Some(443), "/"));
+        assert!(net_allows_port(&any, "example.com", Some(8443), "/"));
+        // A ported rule with a path stays segment-aware.
+        let scoped = Capability::root().attenuate(["urn:cap:net:example.com:8443/api".to_string()]);
+        assert!(net_allows_port(
+            &scoped,
+            "example.com",
+            Some(8443),
+            "/api/v1"
+        ));
+        assert!(!net_allows_port(
+            &scoped,
+            "example.com",
+            Some(8443),
+            "/other"
+        ));
+    }
+
+    #[test]
+    fn ipv6_bracketed_rule_parses_host_and_port() {
+        let cap = Capability::root().attenuate(["urn:cap:net:[::1]:8080".to_string()]);
+        assert!(net_allows_port(&cap, "[::1]", Some(8080), "/v1/chat"));
+        assert!(!net_allows_port(&cap, "[::1]", Some(9090), "/v1/chat"));
+        // Without a trailing `:digits` run the address's own colons are the host.
+        let host_only = Capability::root().attenuate(["urn:cap:net:[::1]".to_string()]);
+        assert!(net_allows_port(&host_only, "[::1]", Some(8080), "/"));
     }
 
     // --- Endpoint behaviour, over a mock transport -------------------------
@@ -973,6 +1130,168 @@ mod tests {
             transport.sends(),
             2,
             "an explicit no-store beats the caller's staleness tolerance"
+        );
+    }
+
+    // --- Redirects: the endpoint follows, the ACL runs per hop ---------------
+
+    /// A transport scripted with a response per call, recording each requested
+    /// URL. When the script runs out it repeats the last response (so a
+    /// redirect-forever loop needs only one entry).
+    struct Seq {
+        responses: std::sync::Mutex<Vec<HttpResponse>>,
+        urls: std::sync::Mutex<Vec<String>>,
+    }
+    impl Seq {
+        fn new(responses: Vec<HttpResponse>) -> Arc<Self> {
+            Arc::new(Seq {
+                responses: std::sync::Mutex::new(responses),
+                urls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl HttpTransport for Seq {
+        async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            self.urls.lock().unwrap().push(request.url.clone());
+            let mut scripted = self.responses.lock().unwrap();
+            Ok(if scripted.len() > 1 {
+                scripted.remove(0)
+            } else {
+                scripted[0].clone()
+            })
+        }
+    }
+
+    fn redirect_to(status: u16, location: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: vec![("location".to_string(), location.to_string())],
+            body: Vec::new(),
+        }
+    }
+
+    fn ok_body(body: &str) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_redirect_to_a_granted_host_is_followed_with_the_acl_re_run() {
+        let transport = Seq::new(vec![
+            redirect_to(302, "https://b.example.com/data"),
+            ok_body("moved here"),
+        ]);
+        let kernel = Kernel::new(Arc::new(space(transport.clone())));
+        let cap = Capability::root().attenuate([
+            "urn:cap:net:a.example.com".to_string(),
+            "urn:cap:net:b.example.com".to_string(),
+        ]);
+        let out =
+            futures::executor::block_on(kernel.issue(get("https://a.example.com/start"), &cap))
+                .unwrap();
+        assert_eq!(out.bytes, b"moved here");
+        assert_eq!(
+            transport.urls(),
+            vec![
+                "https://a.example.com/start".to_string(),
+                "https://b.example.com/data".to_string(),
+            ],
+            "both hops went over the wire, in order"
+        );
+    }
+
+    #[test]
+    fn a_redirect_to_an_ungranted_host_is_a_typed_denial() {
+        // The first host is granted and answers with a 302 to a host the
+        // capability does NOT grant — the classic SSRF-via-redirect. The hop must
+        // die at the ACL, typed `Denied`, without the second request being sent.
+        let transport = Seq::new(vec![
+            redirect_to(302, "http://169.254.169.254/latest/meta-data"),
+            ok_body("must never be reached"),
+        ]);
+        let ep = HttpEndpoint::new(Method::Get, transport.clone());
+        let cap = Capability::root().attenuate(["urn:cap:net:a.example.com".to_string()]);
+        let req = Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap()).with_arg(
+            "url",
+            ArgRef::Inline(b"https://a.example.com/start".to_vec()),
+        );
+        let bindings = ikigai_core::Bindings::new();
+        let inv = Invocation::detached(&req, &bindings, &cap);
+        let err = futures::executor::block_on(ep.invoke(&inv)).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("redirect target"),
+            "the denial names the redirect: {err}"
+        );
+        assert_eq!(
+            transport.urls().len(),
+            1,
+            "the ungranted hop was refused before any I/O"
+        );
+    }
+
+    #[test]
+    fn mutating_methods_never_follow_redirects() {
+        let transport = Seq::new(vec![
+            redirect_to(307, "https://b.example.com/submit"),
+            ok_body("must never be reached"),
+        ]);
+        let kernel = Kernel::new(Arc::new(space(transport.clone())));
+        let cap = Capability::root(); // even root: the refusal is policy, not authority
+        let req = Request::new(Verb::Sink, Iri::parse("urn:httpPost").unwrap())
+            .with_arg(
+                "url",
+                ArgRef::Inline(b"https://a.example.com/form".to_vec()),
+            )
+            .with_arg("content", ArgRef::Inline(b"payload".to_vec()));
+        let err = futures::executor::block_on(kernel.issue(req, &cap)).unwrap_err();
+        assert!(
+            err.to_string().contains("never follow redirects"),
+            "got {err}"
+        );
+        assert_eq!(
+            transport.urls().len(),
+            1,
+            "the body was not replayed at the redirect target"
+        );
+    }
+
+    #[test]
+    fn a_redirect_loop_stops_at_the_hop_limit() {
+        // One scripted entry that repeats: every request 302s back to itself.
+        let transport = Seq::new(vec![redirect_to(302, "https://a.example.com/loop")]);
+        let kernel = Kernel::new(Arc::new(space(transport.clone())));
+        let cap = Capability::root().attenuate(["urn:cap:net:a.example.com".to_string()]);
+        let err =
+            futures::executor::block_on(kernel.issue(get("https://a.example.com/loop"), &cap))
+                .unwrap_err();
+        assert!(err.to_string().contains("too many redirects"), "got {err}");
+        assert_eq!(
+            transport.urls().len(),
+            6,
+            "the original request plus five followed hops, then the limit"
+        );
+    }
+
+    #[test]
+    fn a_relative_location_resolves_against_the_current_url() {
+        let transport = Seq::new(vec![redirect_to(301, "/moved"), ok_body("relative ok")]);
+        let kernel = Kernel::new(Arc::new(space(transport.clone())));
+        let cap = Capability::root().attenuate(["urn:cap:net:a.example.com".to_string()]);
+        let out = futures::executor::block_on(kernel.issue(get("https://a.example.com/old"), &cap))
+            .unwrap();
+        assert_eq!(out.bytes, b"relative ok");
+        assert_eq!(
+            transport.urls()[1],
+            "https://a.example.com/moved",
+            "a relative Location joins the current URL"
         );
     }
 }
