@@ -86,8 +86,8 @@
 //!
 //! A cacheable `GET`/`HEAD` is threaded on its URL (so a later `sink`/`delete` to
 //! the same URL cuts that thread and recomputes it — the write-invalidates-read
-//! half of the golden thread, applied to the web) and marked [`cacheable_until`] a
-//! deadline the kernel's injected [`Clock`] enforces. The freshness window is the
+//! half of the golden thread, applied to the web) and marked [`cacheable_until`](ikigai_core::Representation::cacheable_until) a
+//! deadline the kernel's injected [`Clock`](ikigai_core::Clock) enforces. The freshness window is the
 //! caller's `max_age=` directive (seconds) when given — so a liveness/existence
 //! check can cache a HEAD that carries no freshness of its own — else the response's
 //! `Cache-Control: max-age`; an explicit `no-store`/`no-cache` forbids caching
