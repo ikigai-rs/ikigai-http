@@ -22,10 +22,16 @@ the method — so "is this cached?" falls straight out of the verb:
 | `sink`   | `urn:httpPatch`  | PATCH  | no        |
 | `delete` | `urn:httpDelete` | DELETE | no        |
 
-The URL is an argument (`url=`), so one binding serves every URL and the cache keys
-on the URL. Optional args set request headers: `accept`, `authorization`, `range`,
-and a generic `headers=` block (one `Name: Value` per line); mutating methods also
-take `content=` (the body) and `content_type=`.
+The URL is an argument (`url=`, an `xsd:anyURI`, the only required input), so one
+binding serves every URL and the cache keys on the URL. Optional args set request
+headers: `accept`, `authorization`, `range`, and a generic `headers=` block (one
+`Name: Value` per line); mutating methods also take `content=` (the body) and
+`content_type=`. Every input is typed in the manifold, so `urn:kernel:actions`
+and the MCP projection state the contract an agent can form a call from.
+
+The result carries the origin's `Content-Type`; the declared output
+(`application/octet-stream`) is what an unlabeled response is served as. `HEAD`
+always serves `text/plain` (`true`/`false`) and declares exactly that.
 
 ## Capabilities
 
@@ -51,6 +57,23 @@ the edge, as everywhere in ikigai.
 let space = ikigai_http::space(Arc::new(MyTransport));
 // mount `space` in your kernel, then: source urn:httpGet url=https://example.com
 ```
+
+## Conformance
+
+The module **passes
+[`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)**
+(`tests/conformance.rs`) with no opt-outs: every action fires against a loopback
+origin on an ephemeral port, through the smallest transport that keeps the
+"never follow a redirect" contract. Two walks: over a response with no freshness
+signal nothing is cached (a web read is live by default), and over a
+`Cache-Control: max-age` response `httpGet`/`httpHead` are declared cacheable and
+held to a cache hit under the URL's golden thread. What the suite cannot see is
+pinned beside it: under no grants — or a grant on another host — every verb is a
+typed `Denied` before any socket opens (the origin counts its connections); a
+redirect to a host outside the allowlist dies at the ACL before the hop; an
+`ETag` alone leaves a read live (no conditional revalidation exists); the origin's
+`Content-Type` passes through. `NAMES` is skipped: the six camelCase ids are live
+MCP tool names, renamed in one coordinated pass (wave two).
 
 ## License
 

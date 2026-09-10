@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-http"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Outbound HTTP-client ikigai module: one endpoint per method (urn:httpGet…urn:httpDelete) with the ROC verb mirroring HTTP idempotency, a urn:cap:net host/path-ACL, golden-thread + time-based caching. A cfg-gated backend links into native and wasm32 hosts from one crate."
@@ -26,3 +26,7 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
+# The module recipe as one test (`tests/conformance.rs`). Its own floor on
+# ikigai-core (0.1.67) is above the library's; the library's pin above stays the
+# true minimum of the API the LIBRARY uses.
+ikigai-conformance = "0.1.0"

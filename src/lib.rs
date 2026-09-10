@@ -104,6 +104,12 @@ use ikigai_core::{
 };
 use url::Url;
 
+/// The XSD datatypes the inputs declare: the URL is an IRI, a header value is a
+/// string, a freshness window is a count of seconds.
+const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const XSD_NON_NEGATIVE_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#nonNegativeInteger";
+
 /// One endpoint per HTTP method; the variant fixes the method, the ROC verb it is
 /// resolved with, and (via the verb) its cacheability.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -478,32 +484,76 @@ impl Endpoint for HttpEndpoint {
         self.method.id()
     }
 
+    /// The contract as the manifold states it. Only `url` is required; every
+    /// other input is an optional header or directive. The declared output is
+    /// what the action serves when the origin sends no `Content-Type` — the
+    /// origin's own label passes through otherwise, a set no description can
+    /// enumerate — except `HEAD`, whose `"true"`/`"false"` is always `text/plain`.
     fn describe(&self) -> Description {
+        let summary = if self.method == Method::Head {
+            "Ask whether a URL is present (`true`/`false`) with an HTTP HEAD through a host \
+             transport, capability-gated by `urn:cap:net`."
+        } else {
+            "Dereference a URL as a resource through a host transport, capability-gated by \
+             `urn:cap:net`; the origin's Content-Type labels the result."
+        };
+        let output = if self.method == Method::Head {
+            "text/plain"
+        } else {
+            "application/octet-stream"
+        };
+        let header = |name: &str, summary: &str| {
+            ArgSpec::new(name)
+                .optional()
+                .class(XSD_STRING)
+                .summary(summary)
+        };
         let mut description = Description::new(self.method.id())
             .title(format!("HTTP {}", self.method.as_str()))
-            .summary("Dereference a URL as a resource through a host transport, capability-gated by `urn:cap:net`.")
+            .summary(summary)
             .verb(self.method.verb())
             // The net ACL is parameterized (urn:cap:net:<host-rule>): the wildcard
             // offers this action to any capability holding SOME net grant; the
             // actual host/path is checked against the rules at invoke time.
             .requires("urn:cap:net:*")
-            .output("application/octet-stream")
-            .input(ArgSpec::new("url").summary("the absolute URL to request"))
-            .input(ArgSpec::new("accept").summary("value for the Accept header"))
-            .input(ArgSpec::new("authorization").summary("value for the Authorization header"))
-            .input(ArgSpec::new("range").summary("value for the Range header, e.g. bytes=0-1023"))
-            .input(ArgSpec::new("headers").summary("extra request headers, one `Name: Value` per line"));
-        if self.method.is_cacheable() {
-            description = description.input(ArgSpec::new("max_age").summary(
-                "cache this read for up to N seconds when a stale answer is acceptable (e.g. a \
-                 liveness/existence check); takes precedence over the response's own freshness, \
-                 except an explicit no-store",
+            .output(output)
+            .input(
+                ArgSpec::new("url")
+                    .class(XSD_ANY_URI)
+                    .summary("the absolute URL to request"),
+            )
+            .input(header("accept", "value for the Accept header"))
+            .input(header(
+                "authorization",
+                "value for the Authorization header",
+            ))
+            .input(header(
+                "range",
+                "value for the Range header, e.g. bytes=0-1023",
+            ))
+            .input(header(
+                "headers",
+                "extra request headers, one `Name: Value` per line",
             ));
+        if self.method.is_cacheable() {
+            description = description.input(
+                ArgSpec::new("max_age")
+                    .optional()
+                    .class(XSD_NON_NEGATIVE_INTEGER)
+                    .summary(
+                        "cache this read for up to N seconds when a stale answer is acceptable \
+                         (e.g. a liveness/existence check); takes precedence over the response's \
+                         own freshness, except an explicit no-store",
+                    ),
+            );
         }
         if self.method.is_mutating() {
             description = description
-                .input(ArgSpec::new("content").summary("the request body bytes"))
-                .input(ArgSpec::new("content_type").summary("value for the Content-Type header"));
+                // The body is bytes of whatever type `content_type` says — a PNG is
+                // a valid body. `xsd:string` is the type the WIRE carries (a piped
+                // value, an MCP argument), not a claim about the value.
+                .input(header("content", "the request body bytes"))
+                .input(header("content_type", "value for the Content-Type header"));
         }
         description
     }
