@@ -62,18 +62,29 @@ let space = ikigai_http::space(Arc::new(MyTransport));
 
 The module **passes
 [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)**
-(`tests/conformance.rs`) with no opt-outs: every action fires against a loopback
-origin on an ephemeral port, through the smallest transport that keeps the
-"never follow a redirect" contract. Two walks: over a response with no freshness
-signal nothing is cached (a web read is live by default), and over a
-`Cache-Control: max-age` response `httpGet`/`httpHead` are declared cacheable and
-held to a cache hit under the URL's golden thread. What the suite cannot see is
-pinned beside it: under no grants — or a grant on another host — every verb is a
-typed `Denied` before any socket opens (the origin counts its connections); a
+(`tests/conformance.rs`): every action fires against a loopback origin on an
+ephemeral port, through the smallest transport that keeps the "never follow a
+redirect" contract. Two walks: over a response with no freshness signal
+`httpGet`/`httpHead` are declared **live** and held to it (a web read is live by
+default — the polarity that catches a fresh read quietly becoming cached), and
+over a `Cache-Control: max-age` response the same two are declared **cacheable**
+and held to a cache hit under the URL's golden thread. What the suite cannot see
+is pinned beside it: under no grants — or a grant on another host — every verb is
+a typed `Denied` before any socket opens (the origin counts its connections); a
 redirect to a host outside the allowlist dies at the ACL before the hop; an
-`ETag` alone leaves a read live (no conditional revalidation exists); the origin's
-`Content-Type` passes through. `NAMES` is skipped: the six camelCase ids are live
-MCP tool names, renamed in one coordinated pass (wave two).
+`ETag` alone leaves a read live (no conditional revalidation exists).
+
+Two checks do not apply, and both say why in the printed report. `NAMES` is
+skipped suite-wide: the six camelCase ids are live MCP tool names, renamed in one
+coordinated pass (wave two). `OUTPUTS` is waived **per endpoint** for the five
+actions that serve the origin's own `Content-Type` — `outputs` is a closed list
+in core's `Description`, so there is nothing truthful to declare beyond
+`application/octet-stream`, the type served when the origin labels nothing, and
+enumerating types an origin might send would pass the check by lying. The waiver
+is one check on five ids, never the whole endpoint: `ENFORCED` and `CACHEABLE`
+keep running on all six. What it gives up is pinned by hand — the origin's label
+passes through, an unlabeled response gets the declared fallback, and a label
+with parameters is served as its bare media type.
 
 ## License
 

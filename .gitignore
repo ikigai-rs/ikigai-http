@@ -1,5 +1,5 @@
 /target
 Cargo.lock
-# Local dev redirect to the unpublished ikigai-core checkout (remove once 0.1.12
-# is on crates.io). Kept out of the repo so a fresh checkout builds on published.
+# Any local cargo redirect stays out of the repo: the committed manifest must
+# resolve entirely from crates.io, so a fresh checkout builds on published.
 /.cargo
