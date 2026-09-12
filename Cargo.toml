@@ -32,4 +32,4 @@ futures = "0.3"
 # per-check waiver the five pass-through actions need — `opt_out` would drop
 # ENFORCED and CACHEABLE with it) and `Suite::live` (the declaration that makes
 # "a web read with no freshness signal is live" a checked promise).
-ikigai-conformance = "0.1.1"
+ikigai-conformance = "0.2.0"
