@@ -17,8 +17,6 @@ categories = ["web-programming::http-client", "wasm"]
 # this module needs: `Expiry::At` / `Representation::cacheable_until`, the injected
 # `Clock`, and `Invocation::now`.
 #
-# DEV: a gitignored `.cargo/config.toml` redirects this to the local core checkout
-# until 0.1.12 is published+indexed; remove it once `cargo` can resolve 0.1.12.
 ikigai-core = "0.1.47" # Error::NotFound (HTTP 404/410 → typed not-found) is the true minimum
 async-trait = "0.1"
 # URL parsing (host/path extraction for the capability ACL); runtime-free.
@@ -29,4 +27,9 @@ futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`). Its own floor on
 # ikigai-core (0.1.67) is above the library's; the library's pin above stays the
 # true minimum of the API the LIBRARY uses.
-ikigai-conformance = "0.1.0"
+#
+# 0.1.1 is the true minimum of the API the TEST uses: `Suite::opt_out_check` (the
+# per-check waiver the five pass-through actions need — `opt_out` would drop
+# ENFORCED and CACHEABLE with it) and `Suite::live` (the declaration that makes
+# "a web read with no freshness signal is live" a checked promise).
+ikigai-conformance = "0.1.1"

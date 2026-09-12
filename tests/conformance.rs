@@ -6,7 +6,7 @@
 //! CI cannot reach the network, and a module whose every action is an outbound
 //! request has nothing to fire without one. So [`Origin`] is an HTTP/1.1 listener
 //! on `127.0.0.1` at an ephemeral port, scripted by path (`/live`, `/fresh`,
-//! `/etag`, `/no-store`, `/untyped`, `/hop`, `/hop-in`), recording every request
+//! `/etag`, `/no-store`, `/untyped`, `/json`, `/hop`, `/hop-in`), recording every request
 //! it receives and counting every connection it accepts — the count is how a
 //! test proves a socket was NEVER opened. [`Client`] is the smallest
 //! [`HttpTransport`] that speaks to it: one blocking exchange per request, and it
@@ -19,10 +19,13 @@
 //!
 //! - Nothing is `pure`: every result is a read of a remote resource.
 //! - [`conforms`] walks the origin's `/live` path — a `200` with no freshness
-//!   signal — and declares nothing cacheable: a web read with no freshness is a
-//!   live fact, served uncacheable. The suite has no spelling for "live by design"
-//!   (conformance PENDING #22), so [`a_get_is_live_unless_the_response_says_otherwise`]
-//!   pins it by hand.
+//!   signal — and declares `httpGet` and `httpHead` **`live`**: a web read with no
+//!   freshness is a live fact, served uncacheable, and `Suite::live` (0.1.1) holds
+//!   the kernel to `Expiry::Always` there. That is the polarity nothing else can
+//!   see: were a dependency or a stray `.cacheable()` to make this read cached, no
+//!   type would change and no other check would speak. The four mutating verbs are
+//!   not declared live — `Check::Cacheable` returns before looking at a verb that
+//!   is not cacheable, so the declaration would be silently inert.
 //! - [`conforms_and_caches_under_a_freshness_window`] walks `/fresh`
 //!   (`Cache-Control: max-age=60`) over a clocked kernel and declares `httpGet`
 //!   and `httpHead` `cacheable`: held to a cache hit on the second resolution and
@@ -35,9 +38,25 @@
 //!   `ikigai-core-PENDING.md` §1). `Suite::opt_out` cannot carry this — it drops
 //!   the INVOKING checks and leaves NAMES running — so the check is dropped and
 //!   [`names_are_wave_two`] pins the six findings the pass will flip.
+//! - `OUTPUTS` is **waived per endpoint** for the five pass-through actions
+//!   ([`PASS_THROUGH`]), with [`Suite::opt_out_check`] and the reason printed in
+//!   the report. It cannot be satisfied: `httpGet`/`httpPost`/`httpPut`/
+//!   `httpPatch`/`httpDelete` serve whatever `Content-Type` the origin sends, and
+//!   `outputs` is a closed list in core's `Description` — there is no pass-through
+//!   spelling (core PENDING §20 is the condition for removing this waiver). The
+//!   declared `application/octet-stream` is true, and is the ONLY thing that can be
+//!   declared: it is what the action serves when the origin labels nothing. Naming
+//!   the types an origin might send would be a lie that happens to pass.
+//!   ⚠ The waiver is per CHECK, not per endpoint: `Suite::opt_out` would drop
+//!   `ENFORCED` and `CACHEABLE` on the same five, which is this module's most
+//!   valuable coverage. What the waiver gives up is pinned by hand in
+//!   [`declared_outputs_are_the_media_types_served`].
 //!
-//! No opt-outs: every action fires against the loopback origin. No module
-//! namespace: there is no RDF face.
+//! No whole-endpoint opt-outs: every action fires against the loopback origin. No
+//! module namespace: there is no RDF face — so the walk prints no `probed:` line,
+//! and the positive evidence that it looked at anything is the `fixture:` lines,
+//! the endpoint/action counts [`assert_shape`] pins, and the origin's own record
+//! ([`assert_fired_once_each`]).
 //!
 //! ## What the suite cannot see, pinned by hand
 //!
@@ -57,12 +76,16 @@
 //!   `max_age=` → cached; an `ETag` alone → live (no conditional revalidation
 //!   exists — pinned as what the code does, not designed here); `max-age` on a
 //!   clockless kernel → live.
-//! - **Declared outputs against what is served** (PENDING #11/#31,
-//!   [`declared_outputs_are_the_media_types_served`]): `httpHead` serves
-//!   `text/plain` (`true`/`false`), and declares it. The other five serve the
-//!   ORIGIN's `Content-Type`, which no description can enumerate; the declared
-//!   `application/octet-stream` is the type served when the origin sends none,
-//!   and the pass-through is pinned as the exception.
+//! - **What the `OUTPUTS` waiver gives up**
+//!   ([`declared_outputs_are_the_media_types_served`]): `httpHead` serves
+//!   `text/plain` (`true`/`false`), declares it, and is NOT waived — the check runs
+//!   on it. For the five that are waived, the hand test pins all three cases the
+//!   check would have seen: the origin's label passes through (`/live` →
+//!   `text/plain`), an origin that labels nothing gets the declared fallback
+//!   (`/untyped` → `application/octet-stream`), and a label with parameters is
+//!   served as its bare media type (`/json` → `application/json`, the
+//!   `;charset=utf-8` dropped — the same normalization `OUTPUTS` applies before
+//!   comparing).
 //! - **The mutating verbs' `content` reaches the wire** ([`the_mutating_verbs_send_content_as_the_body`]):
 //!   PIPELINE can only say `content` did not raise `MissingArgument`; the origin
 //!   can say the bytes arrived, for all four — `DELETE` included.
@@ -92,6 +115,22 @@ const METHODS: [(&str, &str, Verb); 6] = [
     ("httpPatch", "urn:httpPatch", Verb::Sink),
     ("httpDelete", "urn:httpDelete", Verb::Delete),
 ];
+
+/// The five actions that serve the ORIGIN's `Content-Type` — everything but
+/// `httpHead`, whose `true`/`false` is always `text/plain`. `OUTPUTS` is waived
+/// for exactly these, and for no other check.
+const PASS_THROUGH: [&str; 5] = ["httpGet", "httpPost", "httpPut", "httpPatch", "httpDelete"];
+
+/// Why `OUTPUTS` cannot be satisfied here, printed in every report the suite
+/// produces. It is a condition, not an excuse: the day core can spell a
+/// pass-through output, this waiver comes out.
+const PASS_THROUGH_REASON: &str =
+    "serves the origin's Content-Type: `outputs` is a closed list in core's \
+     `Description` and has no pass-through spelling (core PENDING §20), so the \
+     declared `application/octet-stream` — the type served when the origin labels \
+     nothing — is the only true declaration. Enumerating types an origin might send \
+     would pass this check by lying. What it gives up is pinned in \
+     `declared_outputs_are_the_media_types_served`";
 
 /// The scope that admits the origin, and one that admits a host it is not.
 const ORIGIN_SCOPE: &str = "urn:cap:net:127.0.0.1";
@@ -288,6 +327,16 @@ fn respond(path: &str, port: u16) -> (u16, &'static str, Vec<(&'static str, Stri
         ),
         // No Content-Type at all.
         "/untyped" => (200, "OK", vec![], b"bytes".to_vec()),
+        // A Content-Type carrying a parameter: the bare media type is what is served.
+        "/json" => (
+            200,
+            "OK",
+            vec![(
+                "Content-Type",
+                "application/json; charset=utf-8".to_string(),
+            )],
+            br#"{"ok":true}"#.to_vec(),
+        ),
         // A redirect to the SAME machine under a name the capability does not grant.
         "/hop" => (
             302,
@@ -373,18 +422,23 @@ fn clocked_kernel() -> Kernel {
 }
 
 /// The suite for this module: every action's `url=` on one path of the origin,
-/// NAMES dropped (wave two — see the file docs).
+/// NAMES dropped suite-wide (wave two — see the file docs), OUTPUTS waived for
+/// the five pass-through actions and running everywhere else.
 fn suite(origin: &Origin, path: &str) -> Suite {
     let mut suite = Suite::new().checks(Checks::all() - Checks::NAMES);
     for (id, _, verb) in METHODS {
         suite = suite.fixture(Fixture::new(id, verb).arg("url", origin.url(path)));
     }
+    for id in PASS_THROUGH {
+        suite = suite.opt_out_check(id, Check::Outputs, PASS_THROUGH_REASON);
+    }
     suite
 }
 
-/// The walk saw six endpoints, one action each, skipped exactly NAMES, and opted
-/// nothing out. A seventh endpoint bound without a line here is held to a weaker
-/// standard.
+/// The walk saw six endpoints, one action each, skipped exactly NAMES suite-wide,
+/// waived exactly OUTPUTS on exactly the five pass-through ids, and opted no
+/// endpoint out wholesale. A seventh endpoint bound without a line here, or a
+/// sixth check quietly waived, is held to a weaker standard.
 fn assert_shape(report: &Report) {
     assert_eq!(report.endpoints, METHODS.len(), "{report}");
     assert_eq!(report.actions, METHODS.len(), "one action each: {report}");
@@ -393,7 +447,26 @@ fn assert_shape(report: &Report) {
         vec![Check::Names],
         "only NAMES is skipped: {report}"
     );
-    assert!(report.declared.opted_out.is_empty(), "{report}");
+    assert!(
+        report.declared.opted_out.is_empty(),
+        "no endpoint is opted out wholesale — that would drop ENFORCED and \
+         CACHEABLE with it: {report}"
+    );
+    let waived: Vec<(&str, Check)> = report
+        .declared
+        .opted_out_checks
+        .iter()
+        .map(|o| (o.endpoint.as_str(), o.check))
+        .collect();
+    let expected: Vec<(&str, Check)> = PASS_THROUGH
+        .iter()
+        .map(|id| (*id, Check::Outputs))
+        .collect();
+    assert_eq!(
+        waived, expected,
+        "OUTPUTS is waived for the five pass-through actions and nothing else — \
+         `httpHead` declares what it serves and is checked: {report}"
+    );
 }
 
 /// Every action was fired exactly once under root, in walk order — the second
@@ -408,15 +481,25 @@ fn assert_fired_once_each(origin: &Origin) {
     );
 }
 
+/// Over `/live` — a `200` with no freshness signal — the two cacheable verbs are
+/// declared **live**, and the suite holds them to `Expiry::Always` even on a
+/// clocked kernel that could have granted a window. Declared, not merely absent:
+/// "nobody said anything and it silently became cacheable" is the one direction
+/// `CACHEABLE` is otherwise blind to, and a web read that starts being served from
+/// the cache changes no type and fails no other test.
 #[test]
 fn conforms() {
     let origin = Origin::start();
-    let report = suite(&origin, "/live").run_blocking(&clocked_kernel());
+    let report = suite(&origin, "/live")
+        .live("httpGet")
+        .live("httpHead")
+        .run_blocking(&clocked_kernel());
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
-    assert!(report.is_clean(), "{report}");
+    report.assert_clean();
     assert_shape(&report);
     assert!(report.declared.cacheable.is_empty(), "{report}");
+    assert_eq!(report.declared.live, ["httpGet", "httpHead"], "{report}");
     assert_fired_once_each(&origin);
 }
 
@@ -428,14 +511,40 @@ fn conforms_and_caches_under_a_freshness_window() {
         .cacheable("httpHead")
         .run_blocking(&clocked_kernel());
     eprintln!("{report}");
-    assert!(report.is_clean(), "{report}");
+    report.assert_clean();
     assert_shape(&report);
     assert_eq!(
         report.declared.cacheable,
         ["httpGet", "httpHead"],
         "{report}"
     );
+    assert!(
+        report.declared.live.is_empty(),
+        "the same two ids are live over `/live` and cacheable over `/fresh`: the \
+         declaration is about the ORIGIN's answer, not the endpoint: {report}"
+    );
     assert_fired_once_each(&origin);
+}
+
+/// The `live` declaration is load-bearing, not decorative: the SAME declaration
+/// that is clean over `/live` goes red over `/fresh`, where the origin grants a
+/// window and the clocked kernel takes it. Without this, "declared live" would be
+/// a comment the suite happens to print — and the failure it exists to catch (a
+/// read that must be fresh quietly becoming cached, changing no type and failing
+/// no other check) would still be invisible.
+#[test]
+fn a_live_declaration_goes_red_when_the_read_becomes_cached() {
+    let origin = Origin::start();
+    let report = suite(&origin, "/fresh")
+        .live("httpGet")
+        .live("httpHead")
+        .run_blocking(&clocked_kernel());
+    let flagged: Vec<&str> = report
+        .of(Check::Cacheable)
+        .map(|f| f.endpoint.as_str())
+        .collect();
+    assert_eq!(flagged, ["httpGet", "httpHead"], "{report}");
+    assert_eq!(report.findings.len(), 2, "only that: {report}");
 }
 
 /// The six findings the wave-two rename will flip: one NAMES line per id, and
@@ -661,12 +770,15 @@ fn declared_outputs(kernel: &Kernel, iri: &str) -> Vec<String> {
         .collect()
 }
 
-/// What `ikigai-conformance` 0.1.0 does not check (its PENDING #11): a declared
-/// output that is not an RDF face is never compared with what the action serves.
-/// `httpHead` always serves `text/plain` and declares exactly that. The other
-/// five serve the origin's `Content-Type`: the declared `application/octet-stream`
-/// is what they serve when the origin sends none, and the pass-through of the
-/// origin's own label is pinned as the exception no description can enumerate.
+/// What the `OUTPUTS` waiver gives up, pinned by hand. `httpHead` is NOT waived:
+/// it always serves `text/plain`, declares exactly that, and the check covers it —
+/// this test only re-states it so the pair reads together. For the five that are
+/// waived, every case the check would have observed is asserted here: the declared
+/// `application/octet-stream` IS what an unlabeled response is served as, the
+/// origin's own label passes through unchanged, and a label carrying parameters is
+/// served as its bare media type — the same `;`-stripping `OUTPUTS` does before
+/// comparing, which is where a pass-through and a declaration could silently
+/// diverge.
 #[test]
 fn declared_outputs_are_the_media_types_served() {
     let origin = Origin::start();
@@ -688,6 +800,7 @@ fn declared_outputs_are_the_media_types_served() {
         if verb == Verb::Exists {
             continue;
         }
+        assert!(PASS_THROUGH.contains(&id), "{id} is one of the waived five");
         assert_eq!(
             declared_outputs(&kernel, iri),
             ["application/octet-stream"],
@@ -710,6 +823,12 @@ fn declared_outputs_are_the_media_types_served() {
         assert_eq!(
             typed.repr_type.media_type, "text/plain",
             "{id}: the origin's label passes through — outside the declared list, by design"
+        );
+        let parameterized = issue(&kernel, verb, iri, &[("url", &origin.url("/json"))], &root)
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(
+            parameterized.repr_type.media_type, "application/json",
+            "{id}: the label's parameters are dropped — the bare media type is served"
         );
     }
 }
