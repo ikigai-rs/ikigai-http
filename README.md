@@ -75,8 +75,9 @@ redirect to a host outside the allowlist dies at the ACL before the hop; an
 `ETag` alone leaves a read live (no conditional revalidation exists).
 
 Two checks do not apply, and both say why in the printed report. `NAMES` is
-skipped suite-wide: the six camelCase ids are live MCP tool names, renamed in one
-coordinated pass (wave two). `OUTPUTS` is waived **per endpoint** for the five
+skipped suite-wide: the six camelCase ids are live MCP tool names, so renaming them
+would break any agent already holding those tools — it needs one coordinated pass
+across every module that projects them, and that has not happened. `OUTPUTS` is waived **per endpoint** for the five
 actions that serve the origin's own `Content-Type` — `outputs` is a closed list
 in core's `Description`, so there is nothing truthful to declare beyond
 `application/octet-stream`, the type served when the origin labels nothing, and
