@@ -792,6 +792,42 @@ mod tests {
         assert!(!net_allows(&cap, "example.com", "/admin/users"));
     }
 
+    /// A host deny survives both of core's narrowing operations (ledger #874, after
+    /// core 0.1.86 made exclusions sticky, ledger #858). Through core 0.1.85,
+    /// `attenuate` and `clamp` kept only the scopes BOTH sides named, so a delegate that
+    /// asked for the host allow alone, or a peer that carried only it, shed the
+    /// `-example.com/admin` exclusion and reached `/admin`: narrowing WIDENED. This test
+    /// fails on 0.1.85 and passes on 0.1.86, which is why the core floor is 0.1.86.
+    #[test]
+    fn a_host_deny_survives_attenuate_and_clamp() {
+        let held =
+            Capability::scoped(["urn:cap:net:example.com", "urn:cap:net:-example.com/admin"]);
+        assert!(!net_allows(&held, "example.com", "/admin"));
+
+        // A delegate asks for the allow alone; the exclusion comes along regardless.
+        let delegated = held.attenuate(["urn:cap:net:example.com"]);
+        // A peer carries only the allow; the server resolves under ceiling.clamp(carried).
+        let clamped = held.clamp(&Capability::scoped(["urn:cap:net:example.com"]));
+
+        for narrowed in [&delegated, &clamped] {
+            assert!(
+                narrowed
+                    .scopes()
+                    .is_some_and(|s| s.contains("urn:cap:net:-example.com/admin")),
+                "the exclusion was dropped: {narrowed:?}"
+            );
+            assert!(net_allows(narrowed, "example.com", "/api"));
+            assert!(!net_allows(narrowed, "example.com", "/admin"));
+            assert!(!net_allows(narrowed, "example.com", "/admin/users"));
+            assert!(!net_allows_port(
+                narrowed,
+                "example.com",
+                Some(443),
+                "/admin"
+            ));
+        }
+    }
+
     #[test]
     fn no_matching_rule_is_default_deny() {
         let cap = Capability::root().attenuate(["urn:cap:net:example.com".to_string()]);
