@@ -17,7 +17,13 @@ categories = ["web-programming::http-client", "wasm"]
 # this module needs: `Expiry::At` / `Representation::cacheable_until`, the injected
 # `Clock`, and `Invocation::now`.
 #
-ikigai-core = "0.1.47" # Error::NotFound (HTTP 404/410 → typed not-found) is the true minimum
+# 0.1.86 is a SAFETY floor, not an API one (Error::NotFound, from 0.1.47, is the
+# newest API this crate calls). Through 0.1.85 `Capability::attenuate` and `clamp`
+# dropped a `urn:cap:net:-<rule>` exclusion that the requested or carried side did
+# not also name, so narrowing a host allow plus a path deny re-opened the denied
+# path. 0.1.86 keeps every exclusion through both (ledger #858);
+# `a_host_deny_survives_attenuate_and_clamp` fails below it.
+ikigai-core = "0.1.86"
 async-trait = "0.1"
 # URL parsing (host/path extraction for the capability ACL); runtime-free.
 url = "2"
