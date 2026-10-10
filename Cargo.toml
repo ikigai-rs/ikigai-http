@@ -30,12 +30,19 @@ url = "2"
 
 [dev-dependencies]
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`). Its own floor on
-# ikigai-core (0.1.67) is above the library's; the library's pin above stays the
-# true minimum of the API the LIBRARY uses.
+# The module recipe as one test (`tests/conformance.rs`).
 #
-# 0.1.1 is the true minimum of the API the TEST uses: `Suite::opt_out_check` (the
-# per-check waiver the five pass-through actions need — `opt_out` would drop
-# ENFORCED and CACHEABLE with it) and `Suite::live` (the declaration that makes
-# "a web read with no freshness signal is live" a checked promise).
-ikigai-conformance = "0.2.0"
+# 0.6.0 is the true minimum of the API the TEST uses: `Suite::host_named_space`
+# (SPACE-NAME, 0.6.0: `space(transport)` is instance-built, so the host names it),
+# `Suite::opt_out_check` (the per-check waiver the five pass-through actions need;
+# `opt_out` would drop ENFORCED and CACHEABLE with it) and `Suite::live` (the
+# declaration that makes "a web read with no freshness signal is live" a checked
+# promise). Read the caret as a RANGE: `^0.6.0` is `<0.7.0`, a ceiling as well as a
+# floor (field guide rule 5), so a 0.7 needs a deliberate bump here.
+#
+# Its own floor on ikigai-core (0.1.89) is above the library's, and every build
+# that compiles the test resolves to it; the test's `EndpointSpace::named` and
+# `space_iri` (0.1.89) ride on that edge. The library's pin above deliberately stays
+# the true minimum of what the LIBRARY uses, so this raise changes nothing a
+# consumer of the crate resolves.
+ikigai-conformance = "0.6.0"
