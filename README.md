@@ -74,6 +74,11 @@ a typed `Denied` before any socket opens (the origin counts its connections); a
 redirect to a host outside the allowlist dies at the ACL before the hop; an
 `ETag` alone leaves a read live (no conditional revalidation exists).
 
+`space(transport)` carries **no name of its own**, and the suite holds it to that
+(`SPACE-NAME`, declared host-named). It is instance-built: its doors close over
+the transport the host hands it, and a space's name is a cache claim (same name,
+same doors), so only the host knows which instance it is and the host names it.
+
 Two checks do not apply, and both say why in the printed report. `NAMES` is
 skipped suite-wide: the six camelCase ids are live MCP tool names, so renaming them
 would break any agent already holding those tools — it needs one coordinated pass

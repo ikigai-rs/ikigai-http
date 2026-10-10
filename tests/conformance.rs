@@ -51,6 +51,14 @@
 //!   `ENFORCED` and `CACHEABLE` on the same five, which is this module's most
 //!   valuable coverage. What the waiver gives up is pinned by hand in
 //!   [`declared_outputs_are_the_media_types_served`].
+//! - **`SPACE-NAME`: [`ikigai_http::space`] is host-named** ([`SPACE_LABEL`]).
+//!   It is instance-built: its six doors close over the [`HttpTransport`] the host
+//!   hands it, so two calls with two transports are two different spaces, and a
+//!   name of its own would claim they are one (a name is a cache claim: same name,
+//!   same doors). So the space stays anonymous and the host names it. The suite is
+//!   handed the SAME `Arc` the kernel walks ([`http_space`]), and holds it to
+//!   `id() == None` and an anonymous topology root.
+//!   [`a_self_named_http_space_goes_red`] shows the declaration is load-bearing.
 //!
 //! No whole-endpoint opt-outs: every action fires against the loopback origin. No
 //! module namespace: there is no RDF face — so the walk prints no `probed:` line,
@@ -94,9 +102,10 @@
 //!   PENDING #5), every input has a class, every action declares `urn:cap:net:*`.
 
 use async_trait::async_trait;
-use ikigai_conformance::{Check, Checks, Fixture, Report, Suite};
+use ikigai_conformance::{Check, Checks, Fixture, Report, SpaceNaming, Suite};
 use ikigai_core::{
-    ArgRef, Capability, Clock, Error, Iri, Kernel, Representation, Request, Time, Verb,
+    space_iri, ArgRef, Capability, Clock, EndpointSpace, Error, Iri, Kernel, Representation,
+    Request, Time, Verb,
 };
 use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
 use std::io::{Read, Write};
@@ -131,6 +140,10 @@ const PASS_THROUGH_REASON: &str =
      nothing — is the only true declaration. Enumerating types an origin might send \
      would pass this check by lying. What it gives up is pinned in \
      `declared_outputs_are_the_media_types_served`";
+
+/// What `SPACE-NAME` findings name [`ikigai_http::space`] by: the call, since a
+/// host-named space is declared by value and has no IRI of its own.
+const SPACE_LABEL: &str = "ikigai_http::space(transport)";
 
 /// The scope that admits the origin, and one that admits a host it is not.
 const ORIGIN_SCOPE: &str = "urn:cap:net:127.0.0.1";
@@ -413,19 +426,36 @@ impl Clock for Fixed {
     }
 }
 
+/// The module's space over the loopback client, built once so the kernel and the
+/// suite's `host_named_space` declaration hold the SAME instance.
+fn http_space() -> Arc<EndpointSpace> {
+    Arc::new(ikigai_http::space(Arc::new(Client)))
+}
+
+fn kernel_over(space: &Arc<EndpointSpace>) -> Kernel {
+    Kernel::new(space.clone())
+}
+
+fn clocked_kernel_over(space: &Arc<EndpointSpace>) -> Kernel {
+    kernel_over(space).with_clock(Arc::new(Fixed))
+}
+
 fn kernel() -> Kernel {
-    Kernel::new(Arc::new(ikigai_http::space(Arc::new(Client))))
+    kernel_over(&http_space())
 }
 
 fn clocked_kernel() -> Kernel {
-    kernel().with_clock(Arc::new(Fixed))
+    clocked_kernel_over(&http_space())
 }
 
 /// The suite for this module: every action's `url=` on one path of the origin,
 /// NAMES dropped suite-wide (wave two — see the file docs), OUTPUTS waived for
-/// the five pass-through actions and running everywhere else.
-fn suite(origin: &Origin, path: &str) -> Suite {
-    let mut suite = Suite::new().checks(Checks::all() - Checks::NAMES);
+/// the five pass-through actions and running everywhere else, and `space` (the
+/// instance the kernel walks) declared host-named.
+fn suite(origin: &Origin, path: &str, space: &Arc<EndpointSpace>) -> Suite {
+    let mut suite = Suite::new()
+        .checks(Checks::all() - Checks::NAMES)
+        .host_named_space(SPACE_LABEL, space.clone());
     for (id, _, verb) in METHODS {
         suite = suite.fixture(Fixture::new(id, verb).arg("url", origin.url(path)));
     }
@@ -467,6 +497,17 @@ fn assert_shape(report: &Report) {
         "OUTPUTS is waived for the five pass-through actions and nothing else — \
          `httpHead` declares what it serves and is checked: {report}"
     );
+    let spaces: Vec<(&str, SpaceNaming)> = report
+        .declared
+        .spaces
+        .iter()
+        .map(|s| (s.label.as_str(), s.naming))
+        .collect();
+    assert_eq!(
+        spaces,
+        [(SPACE_LABEL, SpaceNaming::HostNamed)],
+        "the one space constructor is declared, host-named: {report}"
+    );
 }
 
 /// Every action was fired exactly once under root, in walk order — the second
@@ -490,10 +531,11 @@ fn assert_fired_once_each(origin: &Origin) {
 #[test]
 fn conforms() {
     let origin = Origin::start();
-    let report = suite(&origin, "/live")
+    let space = http_space();
+    let report = suite(&origin, "/live", &space)
         .live("httpGet")
         .live("httpHead")
-        .run_blocking(&clocked_kernel());
+        .run_blocking(&clocked_kernel_over(&space));
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     report.assert_clean();
@@ -506,10 +548,11 @@ fn conforms() {
 #[test]
 fn conforms_and_caches_under_a_freshness_window() {
     let origin = Origin::start();
-    let report = suite(&origin, "/fresh")
+    let space = http_space();
+    let report = suite(&origin, "/fresh", &space)
         .cacheable("httpGet")
         .cacheable("httpHead")
-        .run_blocking(&clocked_kernel());
+        .run_blocking(&clocked_kernel_over(&space));
     eprintln!("{report}");
     report.assert_clean();
     assert_shape(&report);
@@ -535,16 +578,44 @@ fn conforms_and_caches_under_a_freshness_window() {
 #[test]
 fn a_live_declaration_goes_red_when_the_read_becomes_cached() {
     let origin = Origin::start();
-    let report = suite(&origin, "/fresh")
+    let space = http_space();
+    let report = suite(&origin, "/fresh", &space)
         .live("httpGet")
         .live("httpHead")
-        .run_blocking(&clocked_kernel());
+        .run_blocking(&clocked_kernel_over(&space));
     let flagged: Vec<&str> = report
         .of(Check::Cacheable)
         .map(|f| f.endpoint.as_str())
         .collect();
     assert_eq!(flagged, ["httpGet", "httpHead"], "{report}");
     assert_eq!(report.findings.len(), 2, "only that: {report}");
+}
+
+/// The host-named declaration is load-bearing, not decorative: the same space
+/// carrying a name of its own (`urn:iki:space:http`, what a self-named module would
+/// claim) goes red under the same declaration. Were `space()` to start naming
+/// itself, every host that passes it a different transport would share one cache
+/// partition and one topology node across instances with different doors, and no
+/// type would change.
+#[test]
+fn a_self_named_http_space_goes_red() {
+    let named = Arc::new(ikigai_http::space(Arc::new(Client)).named(space_iri("http")));
+    let report = Suite::new()
+        .checks(Checks::SPACE_NAME)
+        .host_named_space(SPACE_LABEL, named.clone())
+        .run_blocking(&Kernel::new(named));
+    eprintln!("{report}");
+    let flagged: Vec<&str> = report
+        .of(Check::SpaceName)
+        .map(|f| f.endpoint.as_str())
+        .collect();
+    assert!(!flagged.is_empty(), "{report}");
+    assert!(flagged.iter().all(|l| *l == SPACE_LABEL), "{report}");
+    assert_eq!(
+        report.findings.len(),
+        flagged.len(),
+        "only SPACE-NAME: {report}"
+    );
 }
 
 /// The six findings the wave-two rename will flip: one NAMES line per id, and
