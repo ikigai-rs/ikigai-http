@@ -59,6 +59,17 @@
 //!   handed the SAME `Arc` the kernel walks ([`http_space`]), and holds it to
 //!   `id() == None` and an anonymous topology root.
 //!   [`a_self_named_http_space_goes_red`] shows the declaration is load-bearing.
+//! - **`REQUIRED` covers the four mutating verbs too** (`Suite::required_on_mutating`,
+//!   0.8.0). `url` is the one required input on all six actions, and dropping it
+//!   must be refused with a typed `MissingArgument` before any socket opens: the
+//!   "declared required, actually optional" direction that
+//!   [`the_manifold_states_the_contract`] could only pin as a declaration before
+//!   0.8.0. Turning it on for `Sink`/`Delete` is safe here and nowhere near a
+//!   live service: each drop is refused at `inv.inline_str("url")` before the
+//!   transport is called, and [`assert_fired_once_each`] proves it, since the
+//!   origin still sees exactly six requests (the pipeline probe's firing is the
+//!   baseline each drop is measured against, so no extra baseline firing is made).
+//!   A clean `DECLARATIONS` is the evidence the declaration reached the check.
 //!
 //! No whole-endpoint opt-outs: every action fires against the loopback origin. No
 //! module namespace: there is no RDF face — so the walk prints no `probed:` line,
@@ -98,8 +109,10 @@
 //!   PIPELINE can only say `content` did not raise `MissingArgument`; the origin
 //!   can say the bytes arrived, for all four — `DELETE` included.
 //! - **The manifold states the contract** ([`the_manifold_states_the_contract`]):
-//!   only `url` is required (no check can see "required but actually optional",
-//!   PENDING #5), every input has a class, every action declares `urn:cap:net:*`.
+//!   only `url` is required, every input has a class, every action declares
+//!   `urn:cap:net:*`. That `url` really IS required (refused when absent) is
+//!   `REQUIRED`'s, on all six verbs; this pins that nothing ELSE is declared
+//!   required, the direction `REQUIRED` cannot see.
 
 use async_trait::async_trait;
 use ikigai_conformance::{Check, Checks, Fixture, Report, SpaceNaming, Suite};
@@ -450,11 +463,13 @@ fn clocked_kernel() -> Kernel {
 
 /// The suite for this module: every action's `url=` on one path of the origin,
 /// NAMES dropped suite-wide (wave two — see the file docs), OUTPUTS waived for
-/// the five pass-through actions and running everywhere else, and `space` (the
-/// instance the kernel walks) declared host-named.
+/// the five pass-through actions and running everywhere else, REQUIRED held on
+/// the mutating verbs too, and `space` (the instance the kernel walks) declared
+/// host-named.
 fn suite(origin: &Origin, path: &str, space: &Arc<EndpointSpace>) -> Suite {
     let mut suite = Suite::new()
         .checks(Checks::all() - Checks::NAMES)
+        .required_on_mutating()
         .host_named_space(SPACE_LABEL, space.clone());
     for (id, _, verb) in METHODS {
         suite = suite.fixture(Fixture::new(id, verb).arg("url", origin.url(path)));
@@ -507,6 +522,17 @@ fn assert_shape(report: &Report) {
         spaces,
         [(SPACE_LABEL, SpaceNaming::HostNamed)],
         "the one space constructor is declared, host-named: {report}"
+    );
+    assert!(report.declared.required_on_mutating, "{report}");
+    let unobserved: Vec<&str> = report
+        .unprobed
+        .iter()
+        .filter(|u| u.check == Check::Required)
+        .map(|u| u.endpoint.as_str())
+        .collect();
+    assert!(
+        unobserved.is_empty(),
+        "REQUIRED observed a dropped `url` on every verb, none left unprobed: {report}"
     );
 }
 
