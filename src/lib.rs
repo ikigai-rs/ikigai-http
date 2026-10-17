@@ -10,17 +10,36 @@
 //! one whose cacheability matches the method's idempotency — so "is this cached?"
 //! falls straight out of the verb:
 //!
-//! | resolve            | IRI               | HTTP   | cacheable |
-//! |--------------------|-------------------|--------|-----------|
-//! | `source`           | `urn:httpGet`     | GET    | yes       |
-//! | `exists`           | `urn:httpHead`    | HEAD   | yes       |
-//! | `sink`             | `urn:httpPost`    | POST   | no        |
-//! | `sink`             | `urn:httpPut`     | PUT    | no        |
-//! | `sink`             | `urn:httpPatch`   | PATCH  | no        |
-//! | `delete`           | `urn:httpDelete`  | DELETE | no        |
+//! | resolve            | IRI                | id            | HTTP   | cacheable |
+//! |--------------------|--------------------|---------------|--------|-----------|
+//! | `source`           | `urn:http:get`     | `http-get`    | GET    | yes       |
+//! | `exists`           | `urn:http:head`    | `http-head`   | HEAD   | yes       |
+//! | `sink`             | `urn:http:post`    | `http-post`   | POST   | no        |
+//! | `sink`             | `urn:http:put`     | `http-put`    | PUT    | no        |
+//! | `sink`             | `urn:http:patch`   | `http-patch`  | PATCH  | no        |
+//! | `delete`           | `urn:http:delete`  | `http-delete` | DELETE | no        |
 //!
 //! The target URL is an argument (`url=`), not part of the IRI, so one binding
 //! serves every URL and the cache keys on the URL via the request identity.
+//!
+//! ## Deprecated names (removed in 0.3.0)
+//!
+//! Through 0.1.x the six bound at `urn:httpGet` … `urn:httpDelete` with ids
+//! `httpGet` … `httpDelete`. 0.2.0 renamed them to the kebab-case convention
+//! ikigai-core's crate docs state, and keeps each old IRI as a deprecated
+//! **alias** of its new one for this minor release, so a consumer holding an old
+//! name keeps working while it migrates (see [`deprecated_aliases`]). An alias
+//! resolves exactly as its backing name: one cache entry, one golden thread, the
+//! backing description (id `http-get`, not `httpGet`), and only the new names in
+//! the catalog. The old ids are NOT kept: an id is a name, not an IRI, and nothing
+//! resolves by it, so an agent's MCP tool names move with this release.
+//!
+//! ```
+//! use ikigai_http::Method;
+//! assert_eq!(Method::Get.iri(), "urn:http:get");
+//! assert_eq!(Method::Get.id(), "http-get");
+//! assert_eq!(Method::Get.deprecated_iri(), "urn:httpGet");
+//! ```
 //! (OPTIONS-as-`meta` from the locked design is deferred: the kernel intercepts
 //! `Verb::Meta` to render an endpoint's *self-description*, so it never reaches the
 //! endpoint — wiring OPTIONS needs that routing question settled first.)
@@ -99,8 +118,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri, ReprType,
-    Representation, Request, Result, Verb,
+    Alias, AliasTable, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact,
+    Invocation, Iri, ReprType, Representation, Request, Result, Verb,
 };
 use url::Url;
 
@@ -146,8 +165,32 @@ impl Method {
         }
     }
 
-    /// The conventional IRI this method binds at.
+    /// Every method, in the order [`space`] binds them.
+    pub const ALL: [Method; 6] = [
+        Method::Get,
+        Method::Head,
+        Method::Post,
+        Method::Put,
+        Method::Patch,
+        Method::Delete,
+    ];
+
+    /// The conventional IRI this method binds at: `urn:http:` plus the method,
+    /// lowercased.
     pub fn iri(self) -> &'static str {
+        match self {
+            Method::Get => "urn:http:get",
+            Method::Head => "urn:http:head",
+            Method::Post => "urn:http:post",
+            Method::Put => "urn:http:put",
+            Method::Patch => "urn:http:patch",
+            Method::Delete => "urn:http:delete",
+        }
+    }
+
+    /// The pre-0.2.0 IRI, kept bound as a deprecated alias of [`iri`](Self::iri)
+    /// through the 0.2.x line and removed in 0.3.0. See [`deprecated_aliases`].
+    pub fn deprecated_iri(self) -> &'static str {
         match self {
             Method::Get => "urn:httpGet",
             Method::Head => "urn:httpHead",
@@ -158,17 +201,18 @@ impl Method {
         }
     }
 
-    /// The endpoint's description id — UNIQUE per method, so the catalog subject
-    /// (`urn:ikigai:endpoint:{id}`) and any projection keyed on it (e.g. an MCP
-    /// tool name) don't collide across the six method endpoints.
+    /// The endpoint's description id: a kebab-case noun, the one the MCP
+    /// projection turns into an agent's tool name. UNIQUE per method, so the
+    /// catalog subject (`urn:ikigai:endpoint:{id}`) and any projection keyed on it
+    /// don't collide across the six method endpoints.
     pub fn id(self) -> &'static str {
         match self {
-            Method::Get => "httpGet",
-            Method::Head => "httpHead",
-            Method::Post => "httpPost",
-            Method::Put => "httpPut",
-            Method::Patch => "httpPatch",
-            Method::Delete => "httpDelete",
+            Method::Get => "http-get",
+            Method::Head => "http-head",
+            Method::Post => "http-post",
+            Method::Put => "http-put",
+            Method::Patch => "http-patch",
+            Method::Delete => "http-delete",
         }
     }
 
@@ -559,24 +603,70 @@ impl Endpoint for HttpEndpoint {
     }
 }
 
-/// Mount all six HTTP-method endpoints on one host transport: `urn:httpGet`,
-/// `urn:httpHead`, `urn:httpPost`, `urn:httpPut`, `urn:httpPatch`, `urn:httpDelete`.
-pub fn space(transport: Arc<dyn HttpTransport>) -> EndpointSpace {
+/// Mount all six HTTP-method endpoints on one host transport: `urn:http:get`,
+/// `urn:http:head`, `urn:http:post`, `urn:http:put`, `urn:http:patch`,
+/// `urn:http:delete`, plus the six pre-0.2.0 names (`urn:httpGet` …) as deprecated
+/// aliases of them, through 0.2.x only (see [`deprecated_aliases`]).
+///
+/// The space is an [`Alias`] over the six bindings ([`endpoints`]): the overlay
+/// core provides for exactly this migration, so an old name shares its new name's
+/// cache entry and golden thread, describes itself by the new id, and is absent
+/// from the catalog. Hold it as an `Arc<dyn Space>`: in 0.3.0, when the aliases
+/// go, this returns the [`EndpointSpace`] again.
+///
+/// ```
+/// use std::sync::Arc;
+/// use ikigai_core::{Iri, Kernel};
+/// use ikigai_http::{HttpRequest, HttpResponse, HttpTransport};
+///
+/// struct Offline;
+/// #[async_trait::async_trait]
+/// impl HttpTransport for Offline {
+///     async fn send(&self, _: HttpRequest) -> Result<HttpResponse, String> {
+///         Err("offline".into())
+///     }
+/// }
+///
+/// let kernel = Kernel::new(Arc::new(ikigai_http::space(Arc::new(Offline))));
+/// let old = kernel.describe(&Iri::parse("urn:http:get").unwrap()).unwrap();
+/// let new = kernel.describe(&Iri::parse("urn:http:get").unwrap()).unwrap();
+/// assert_eq!(old.id, "http-get");
+/// assert_eq!(old.id, new.id);
+/// ```
+pub fn space(transport: Arc<dyn HttpTransport>) -> Alias {
+    Alias::new(
+        Arc::new(deprecated_aliases()),
+        Arc::new(endpoints(transport)),
+    )
+}
+
+/// The six HTTP-method endpoints bound at their names, with no aliases: what
+/// [`space`] wraps. For a host that has migrated every caller and wants the old
+/// names to miss now rather than in 0.3.0.
+pub fn endpoints(transport: Arc<dyn HttpTransport>) -> EndpointSpace {
     let mut space = EndpointSpace::new();
-    for method in [
-        Method::Get,
-        Method::Head,
-        Method::Post,
-        Method::Put,
-        Method::Patch,
-        Method::Delete,
-    ] {
+    for method in Method::ALL {
         space = space.bind(
             Exact::new(method.iri()),
             HttpEndpoint::new(method, transport.clone()),
         );
     }
     space
+}
+
+/// The deprecated pre-0.2.0 names as an alias table: one exact rule per method,
+/// `urn:httpGet` → `urn:http:get` and likewise for the other five. [`space`] already
+/// applies it. A host that also wants the rules in the kernel's own hands (the
+/// readout and per-rule counters at `urn:kernel:aliases`, which show whether
+/// anything still calls an old name) installs the same table with
+/// `Kernel::with_aliases`; the two compose, since a canonical name matches no rule.
+/// Removed in 0.3.0.
+pub fn deprecated_aliases() -> AliasTable {
+    Method::ALL
+        .into_iter()
+        .fold(AliasTable::new(), |table, method| {
+            table.exact(method.deprecated_iri(), method.iri())
+        })
 }
 
 fn kernel_cut_iri() -> Iri {
@@ -727,17 +817,7 @@ mod tests {
     fn method_ids_are_unique() {
         // The catalog subject + any projection keyed on the description id (an
         // MCP tool name) must not collide across the six method endpoints.
-        let ids: Vec<&str> = [
-            Method::Get,
-            Method::Head,
-            Method::Post,
-            Method::Put,
-            Method::Patch,
-            Method::Delete,
-        ]
-        .iter()
-        .map(|m| m.id())
-        .collect();
+        let ids: Vec<&str> = Method::ALL.iter().map(|m| m.id()).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -754,7 +834,7 @@ mod tests {
         assert!(Method::Put.is_mutating());
         assert!(!Method::Get.is_mutating());
         assert_eq!(Method::Patch.as_str(), "PATCH");
-        assert_eq!(Method::Delete.iri(), "urn:httpDelete");
+        assert_eq!(Method::Delete.iri(), "urn:http:delete");
     }
 
     #[test]
@@ -943,7 +1023,7 @@ mod tests {
     }
 
     fn get(url: &str) -> Request {
-        Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+        Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
     }
 
@@ -965,7 +1045,7 @@ mod tests {
         // The endpoint is invoked directly so we can assert the exact error variant.
         let ep = HttpEndpoint::new(Method::Get, Arc::new(Mock::new(resp(None))));
         let cap = Capability::root().attenuate(["urn:cap:net:other.com".to_string()]);
-        let req = Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+        let req = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()));
         let bindings = ikigai_core::Bindings::new();
         let inv = Invocation::detached(&req, &bindings, &cap);
@@ -1007,7 +1087,7 @@ mod tests {
         assert_eq!(transport.gets(), 1, "cached well within max-age");
 
         // A POST to the same URL cuts its golden thread.
-        let post = Request::new(Verb::Sink, Iri::parse("urn:httpPost").unwrap())
+        let post = Request::new(Verb::Sink, Iri::parse("urn:http:post").unwrap())
             .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
             .with_arg("content", ArgRef::Inline(b"data".to_vec()));
         futures::executor::block_on(kernel.issue(post, &cap)).unwrap();
@@ -1015,6 +1095,110 @@ mod tests {
         // The cached GET is now invalid even though its deadline hasn't passed.
         futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
         assert_eq!(transport.gets(), 2, "GET recomputed after the mutating cut");
+    }
+
+    // --- Deprecated names (0.2.x only; removed in 0.3.0) -------------------
+
+    fn get_at(iri: &str, url: &str) -> Request {
+        Request::new(Verb::Source, Iri::parse(iri).unwrap())
+            .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+    }
+
+    /// `urn:httpGet` resolves exactly as `urn:http:get`: the same bytes and type,
+    /// from ONE cache entry, whichever name computed it. Two entries would be the
+    /// invisible failure: both answers look right, and a write through one name
+    /// leaves the other stale.
+    #[test]
+    fn a_deprecated_name_shares_its_new_names_cache_entry() {
+        for (first, second) in [
+            ("urn:http:get", "urn:httpGet"),
+            ("urn:httpGet", "urn:http:get"),
+        ] {
+            let transport = Arc::new(Mock::new(resp(Some("max-age=60"))));
+            let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                .with_clock(Arc::new(TestClock::at(0)));
+            let cap = Capability::root();
+            let url = "https://example.com/x";
+            let a = futures::executor::block_on(kernel.issue(get_at(first, url), &cap)).unwrap();
+            let b = futures::executor::block_on(kernel.issue(get_at(second, url), &cap)).unwrap();
+            assert_eq!(a.bytes, b.bytes, "{first} then {second}");
+            assert_eq!(a.repr_type, b.repr_type, "{first} then {second}");
+            assert_eq!(
+                transport.gets(),
+                1,
+                "{first} then {second}: one cache entry for both names"
+            );
+        }
+    }
+
+    /// A write through a deprecated name cuts the thread a read through the new
+    /// name hangs on, and the other way round.
+    #[test]
+    fn a_deprecated_name_cuts_and_is_cut_by_its_new_name() {
+        for (read, write) in [
+            ("urn:http:get", "urn:httpPost"),
+            ("urn:httpGet", "urn:http:post"),
+        ] {
+            let transport = Arc::new(Mock::new(resp(Some("max-age=600"))));
+            let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                .with_clock(Arc::new(TestClock::at(0)));
+            let cap = Capability::root();
+            let url = "https://example.com/x";
+            futures::executor::block_on(kernel.issue(get_at(read, url), &cap)).unwrap();
+            let post = Request::new(Verb::Sink, Iri::parse(write).unwrap())
+                .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+                .with_arg("content", ArgRef::Inline(b"data".to_vec()));
+            futures::executor::block_on(kernel.issue(post, &cap)).unwrap();
+            futures::executor::block_on(kernel.issue(get_at(read, url), &cap)).unwrap();
+            assert_eq!(
+                transport.gets(),
+                2,
+                "{write} cut the thread {read} hangs on"
+            );
+        }
+    }
+
+    /// One exact rule per method, old name to new; every old name describes itself
+    /// by the NEW id; the space enumerates the six new names and no old one.
+    #[test]
+    fn the_deprecated_names_alias_the_new_ones_and_stay_out_of_the_catalog() {
+        use ikigai_core::{RuleKind, Space};
+        let table = deprecated_aliases();
+        let rules: Vec<(RuleKind, &str, &str)> = table
+            .rules()
+            .iter()
+            .map(|r| (r.kind(), r.from(), r.to()))
+            .collect();
+        for method in Method::ALL {
+            assert!(
+                rules.contains(&(RuleKind::Exact, method.deprecated_iri(), method.iri())),
+                "{method:?}: {rules:?}"
+            );
+        }
+        assert_eq!(rules.len(), Method::ALL.len(), "{rules:?}");
+
+        let space = Arc::new(space(Arc::new(Mock::new(resp(None)))));
+        let kernel = Kernel::new(space.clone());
+        for method in Method::ALL {
+            let old = kernel
+                .describe(&Iri::parse(method.deprecated_iri()).unwrap())
+                .unwrap_or_else(|| panic!("{} resolves", method.deprecated_iri()));
+            assert_eq!(old.id, method.id(), "{method:?}: the backing id");
+        }
+        let mut patterns: Vec<String> = space
+            .entries()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.pattern)
+            .collect();
+        patterns.sort_unstable();
+        let mut expected: Vec<String> = Method::ALL.iter().map(|m| m.iri().to_string()).collect();
+        expected.sort_unstable();
+        assert_eq!(patterns, expected, "only the new names are enumerated");
+
+        // The unaliased space misses an old name outright.
+        let bare = Kernel::new(Arc::new(endpoints(Arc::new(Mock::new(resp(None))))));
+        assert!(bare.describe(&Iri::parse("urn:httpGet").unwrap()).is_none());
     }
 
     /// A transport that records the headers of the last request it received.
@@ -1032,7 +1216,7 @@ mod tests {
         let transport = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
         let kernel = Kernel::new(Arc::new(space(transport.clone())));
         let cap = Capability::root();
-        let req = Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+        let req = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()))
             .with_arg("accept", ArgRef::Inline(b"application/json".to_vec()))
             .with_arg("range", ArgRef::Inline(b"bytes=0-1023".to_vec()))
@@ -1089,7 +1273,7 @@ mod tests {
 
     fn head_body(status: u16) -> Result<String> {
         let kernel = Kernel::new(Arc::new(space(Status::new(status, None))));
-        let req = Request::new(Verb::Exists, Iri::parse("urn:httpHead").unwrap())
+        let req = Request::new(Verb::Exists, Iri::parse("urn:http:head").unwrap())
             .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()));
         futures::executor::block_on(kernel.issue(req, &Capability::root()))
             .map(|r| String::from_utf8(r.bytes).unwrap())
@@ -1158,7 +1342,7 @@ mod tests {
 
     /// A GET carrying a `max_age` directive, resolved repeatedly.
     fn max_age_get() -> Request {
-        Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap())
+        Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()))
             .with_arg("max_age", ArgRef::Inline(b"3600".to_vec()))
     }
@@ -1304,7 +1488,7 @@ mod tests {
         ]);
         let ep = HttpEndpoint::new(Method::Get, transport.clone());
         let cap = Capability::root().attenuate(["urn:cap:net:a.example.com".to_string()]);
-        let req = Request::new(Verb::Source, Iri::parse("urn:httpGet").unwrap()).with_arg(
+        let req = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap()).with_arg(
             "url",
             ArgRef::Inline(b"https://a.example.com/start".to_vec()),
         );
@@ -1331,7 +1515,7 @@ mod tests {
         ]);
         let kernel = Kernel::new(Arc::new(space(transport.clone())));
         let cap = Capability::root(); // even root: the refusal is policy, not authority
-        let req = Request::new(Verb::Sink, Iri::parse("urn:httpPost").unwrap())
+        let req = Request::new(Verb::Sink, Iri::parse("urn:http:post").unwrap())
             .with_arg(
                 "url",
                 ArgRef::Inline(b"https://a.example.com/form".to_vec()),
