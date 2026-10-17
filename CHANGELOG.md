@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.2.0)
+## 0.2.0
 
 ### Renamed (BREAKING for anything matching on ids or tool names)
 
