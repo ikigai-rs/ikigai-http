@@ -27,6 +27,14 @@ ikigai-core = "0.1.86"
 async-trait = "0.1"
 # URL parsing (host/path extraction for the capability ACL); runtime-free.
 url = "2"
+# The ecosystem's one base64 (ledger #1857), behind `ikigai_http::base64` so no
+# module hand-rolls its own. 0.22 because it is the line already in the graph of
+# the repos that adopt the helper (ikigai-cli pins `base64 = "0.22"`, ikigai-gonk
+# resolves 0.22.1), so they link ONE copy. The API used (`Engine`,
+# `general_purpose::STANDARD`, the four-variant `DecodeError`) is in 0.22.0. Read the
+# caret as a RANGE: `^0.22.0` is `<0.23.0`, a ceiling as well as a floor (field
+# guide rule 5). Pure Rust, no dependencies of its own, wasm-clean.
+base64 = "0.22.0"
 
 [dev-dependencies]
 futures = "0.3"
@@ -48,3 +56,6 @@ futures = "0.3"
 # the true minimum of what the LIBRARY uses, so this raise changes nothing a
 # consumer of the crate resolves.
 ikigai-conformance = "0.8.0"
+# Reads `tests/vectors/auth_vectors.json`, the shared Authorization and base64 vectors
+# Python and Deno pin a byte-identical copy of (ledger #1857). `Value` indexing only.
+serde_json = "1"

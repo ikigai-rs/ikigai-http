@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Added: one Authorization-header and base64 helper (ledger #1857)
+
+Additive; nothing existing changes.
+
+- **`ikigai_http::auth`**: `basic(user, password)` builds an RFC 7617 `Basic` value
+  (UTF-8; refuses a `:` in the user id and any control character, with a typed
+  `AuthError`), `bearer(token)` an RFC 6750 `Bearer` value (refuses anything that is
+  not a `b64token`), and `scheme(value)` splits an incoming `Authorization` value into
+  its case-insensitive scheme and credentials. A built `Authorization` redacts itself
+  in `Debug` and has no `Display`; no error carries a credential.
+- **`ikigai_http::base64`**: `encode` and `decode`, RFC 4648 §4 (standard alphabet,
+  padded, canonical), over the vetted `base64` crate (0.22, already in the graph of
+  the adopters). The module docs give the reasoning.
+- **Shared vectors** in `tests/vectors/auth_vectors.json`, hand-written from RFC 7617,
+  RFC 6750, RFC 9110 and RFC 4648, with stable refusal codes; Python and Deno pin a
+  byte-identical copy.
+
+### Fixed
+
+- The `space()` doctest compared `urn:http:get` with itself; it now describes the
+  deprecated `urn:httpGet` beside `urn:http:get`, so it fails if the alias table is
+  empty (ledger #1852).
+
 ## 0.2.0
 
 ### Renamed (BREAKING for anything matching on ids or tool names)

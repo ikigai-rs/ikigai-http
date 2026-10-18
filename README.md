@@ -74,6 +74,34 @@ deprecated names resolve); hold it as an `Arc<dyn Space>`. `endpoints` returns t
 bare `EndpointSpace` without the aliases, and `deprecated_aliases` the rewrite table,
 for a host that wants it at `urn:kernel:aliases` too (`Kernel::with_aliases`).
 
+## Authorization headers and base64
+
+Two plain-function modules, usable without mounting anything, are the ecosystem's
+one implementation of what every HTTP caller needs, so no module formats a
+`Basic` header or encodes base64 by hand:
+
+```rust
+use ikigai_http::auth;
+
+// RFC 7617: UTF-8, refusing a `:` in the user id and any control character.
+let value = auth::basic("Aladdin", "open sesame")?;
+assert_eq!(value.as_str(), "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+
+// RFC 6750: the token must be a b64token.
+let value = auth::bearer("mF_9.B5f-4.1JqM")?;
+
+// An incoming value: the scheme, case-insensitive, and the credentials after it.
+assert_eq!(auth::scheme("bearer tok"), Some((auth::Scheme::Bearer, "tok")));
+
+// RFC 4648 base64, standard alphabet, padded, canonical.
+assert_eq!(ikigai_http::base64::encode("foobar"), "Zm9vYmFy");
+```
+
+A built `Authorization` prints as `Authorization(Basic <redacted>)` in `Debug` and
+has no `Display`, and a refusal names the rule, never the credential. The behavior
+is pinned by `tests/vectors/auth_vectors.json`, hand-written from the RFCs; the
+Python and Deno faces pin a byte-identical copy.
+
 ## Conformance
 
 The module **passes

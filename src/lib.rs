@@ -81,6 +81,21 @@
 //! capability-gated — the agent gets "may call host X with credential Y", never the
 //! raw token — but that, and headers/body/range/auth args, land with the backend.
 //!
+//! ## Authorization headers and base64: the shared helpers
+//!
+//! Two plain-function modules, usable with or without the endpoints, are the
+//! ecosystem's one implementation of a standard every HTTP caller needs (ledger
+//! #1857): [`auth`] builds `Basic` (RFC 7617) and `Bearer` (RFC 6750) header values
+//! and recognizes the scheme of an incoming one, and [`base64`] is RFC 4648 base64
+//! (the vetted `base64` crate behind a two-function face; [`base64`]'s docs say why).
+//! A module calls these rather than formatting a header or encoding by hand.
+//!
+//! ```
+//! let auth = ikigai_http::auth::basic("Aladdin", "open sesame").unwrap();
+//! assert_eq!(auth.as_str(), "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+//! assert_eq!(ikigai_http::base64::decode(auth.credentials()).unwrap(), b"Aladdin:open sesame");
+//! ```
+//!
 //! ## Honest status (needs `ikigai-core` ≥ 0.1.47)
 //!
 //! The endpoint reports what HTTP said, mapped onto the typed-error taxonomy — it never hands
@@ -122,6 +137,9 @@ use ikigai_core::{
     Invocation, Iri, ReprType, Representation, Request, Result, Verb,
 };
 use url::Url;
+
+pub mod auth;
+pub mod base64;
 
 /// The XSD datatypes the inputs declare: the URL is an IRI, a header value is a
 /// string, a freshness window is a count of seconds.
@@ -628,7 +646,7 @@ impl Endpoint for HttpEndpoint {
 /// }
 ///
 /// let kernel = Kernel::new(Arc::new(ikigai_http::space(Arc::new(Offline))));
-/// let old = kernel.describe(&Iri::parse("urn:http:get").unwrap()).unwrap();
+/// let old = kernel.describe(&Iri::parse("urn:httpGet").unwrap()).unwrap();
 /// let new = kernel.describe(&Iri::parse("urn:http:get").unwrap()).unwrap();
 /// assert_eq!(old.id, "http-get");
 /// assert_eq!(old.id, new.id);
