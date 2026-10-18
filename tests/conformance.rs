@@ -7,7 +7,7 @@
 //! #1875), both `Sink`, both uncacheable, neither following a redirect, and
 //! [`propfind_and_report_reach_the_origin_as_dav_requests`] pins what the suite
 //! cannot see of them. The pre-0.2.0 names `urn:httpGet` …
-//! `urn:httpDelete` stay bound as deprecated aliases through 0.2.x, and
+//! `urn:httpDelete` stay bound as deprecated aliases through 0.3.x, and
 //! [`a_deprecated_name_answers_exactly_as_its_new_name`] pins that each one
 //! answers as its new name does, on every verb, against the real origin.
 //!
@@ -157,7 +157,7 @@ const METHODS: [(&str, &str, Verb); 8] = [
 ];
 
 /// The pre-0.2.0 names, each kept as a deprecated alias of the new one through
-/// 0.2.x and removed in 0.3.0: old IRI, new IRI. Written out rather than read
+/// 0.3.x and removed in a later minor: old IRI, new IRI. Written out rather than read
 /// from `Method::deprecated_iri`, so a typo in the library cannot agree with itself.
 const DEPRECATED: [(&str, &str); 6] = [
     ("urn:httpGet", "urn:http:get"),
@@ -1184,7 +1184,7 @@ fn the_manifold_states_the_contract() {
 }
 
 /// Each deprecated name answers exactly as its new name, on every verb, against the
-/// real origin (0.2.x only; the aliases go in 0.3.0). Exactly: the same request on
+/// real origin (through 0.3.x; the aliases go in a later minor). Exactly: the same request on
 /// the wire (method, path, body), the same bytes and media type back, the same
 /// typed, permanent `Denied` with no socket opened when ungranted, and the NEW id
 /// when it describes itself. Over `/live` both reads reach the origin, so each pair

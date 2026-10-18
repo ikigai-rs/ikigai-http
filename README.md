@@ -50,17 +50,55 @@ method, and never follow a redirect.
 sink urn:http:propfind url=https://dav.example.com/calendars/me/ headers="Depth: 1" content_type=application/xml content=<the propfind XML>
 ```
 
-### Renamed in 0.2.0; the old IRIs are deprecated aliases until 0.3.0
+### Renamed in 0.2.0; the old IRIs are deprecated aliases, still bound in 0.3.x
 
 Through 0.1.x these bound at `urn:httpGet` … `urn:httpDelete` with camelCase ids
 (`httpGet` …). 0.2.0 renamed them to the kebab-case convention ikigai-core states.
-**The old IRIs still resolve through 0.2.x**, as deprecated aliases: `urn:httpGet`
+**The old IRIs still resolve through 0.3.x**, as deprecated aliases: `urn:httpGet`
 answers exactly as `urn:http:get` (one cache entry, one golden thread, the new id
-when it describes itself), and the catalog lists only the new names. **0.3.0
-removes them.** The old ids are not kept: an id is a name, not an IRI, and nothing
+when it describes itself), and the catalog lists only the new names. They were
+due to go in 0.3.0 and **stay bound through 0.3.x**: callers still name them
+(ikigai-runbook's demo commands, an example in ikigai-throttle's docs), and a removed
+name breaks its callers at run time, not at compile time. Their removal is a later
+minor of its own. The old ids are not kept: an id is a name, not an IRI, and nothing
 resolves by it, so MCP tool names and catalog labels move now. PROPFIND and REPORT
 arrived after the rename and have no old name. See
 [CHANGELOG.md](CHANGELOG.md) for the full map.
+
+## Status: one table, typed failures (0.3.0)
+
+The endpoints never hand back an error page dressed up as the resource: a
+non-success status is a typed `ikigai_core::Error`, and its `class()` (core's)
+says who may repeat it. The mapping is ONE public table, `ikigai_http::status`, so
+every module that talks HTTP (ikigai-llm, ikigai-meeting) calls it instead of
+keeping a copy:
+
+| origin status | error | class |
+| --- | --- | --- |
+| 404, 410 | `NotFound` | permanent |
+| **401, 403** | **`Refused`** (was `Denied` before 0.3.0) | refused |
+| 408, 504 | `Timeout` | transient |
+| 409, 412 | `Conflict` | permanent |
+| 413, 414, 431 | `OverBudget` | over-budget |
+| **429** | **`RetryAfter`**, delay from `Retry-After` | retry-after |
+| 503 with a usable `Retry-After` | `RetryAfter` | retry-after |
+| 502, and 503 without one | `Unavailable` | transient |
+| 501 | `Unsupported` | permanent |
+| **500, other 5xx**, other statuses | **`Endpoint`** (500 was `Unavailable`) | unknown |
+
+`Retry-After` is read in both forms: delay-seconds, or an HTTP-date measured on the
+kernel's injected clock (no clock, or a malformed value, means no delay). A
+transport that gives up waiting is `Timeout`; any other transport failure is
+`Unavailable`. `Denied` is now only the capability floor's word: our grant did not
+cover the URL. Each action declares its failure classes (`Description::fails`), so
+the manifold says what can go wrong before anything does. HEAD stays lenient: any
+answered status but 404/410 is `true`.
+
+```rust
+use ikigai_http::status::status_error;
+let err = status_error(429, None, "HTTP 429").unwrap();
+assert_eq!(err.to_string(), "retry later: rate-limited: HTTP 429");
+```
 
 ## Capabilities
 
