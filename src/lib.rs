@@ -10,17 +10,42 @@
 //! one whose cacheability matches the method's idempotency — so "is this cached?"
 //! falls straight out of the verb:
 //!
-//! | resolve            | IRI                | id            | HTTP   | cacheable |
-//! |--------------------|--------------------|---------------|--------|-----------|
-//! | `source`           | `urn:http:get`     | `http-get`    | GET    | yes       |
-//! | `exists`           | `urn:http:head`    | `http-head`   | HEAD   | yes       |
-//! | `sink`             | `urn:http:post`    | `http-post`   | POST   | no        |
-//! | `sink`             | `urn:http:put`     | `http-put`    | PUT    | no        |
-//! | `sink`             | `urn:http:patch`   | `http-patch`  | PATCH  | no        |
-//! | `delete`           | `urn:http:delete`  | `http-delete` | DELETE | no        |
+//! | resolve  | IRI                 | id              | HTTP     | cacheable |
+//! |----------|---------------------|-----------------|----------|-----------|
+//! | `source` | `urn:http:get`      | `http-get`      | GET      | yes       |
+//! | `exists` | `urn:http:head`     | `http-head`     | HEAD     | yes       |
+//! | `sink`   | `urn:http:post`     | `http-post`     | POST     | no        |
+//! | `sink`   | `urn:http:put`      | `http-put`      | PUT      | no        |
+//! | `sink`   | `urn:http:patch`    | `http-patch`    | PATCH    | no        |
+//! | `delete` | `urn:http:delete`   | `http-delete`   | DELETE   | no        |
+//! | `sink`   | `urn:http:propfind` | `http-propfind` | PROPFIND | no        |
+//! | `sink`   | `urn:http:report`   | `http-report`   | REPORT   | no        |
 //!
 //! The target URL is an argument (`url=`), not part of the IRI, so one binding
 //! serves every URL and the cache keys on the URL via the request identity.
+//!
+//! ## WebDAV: PROPFIND and REPORT (0.2.2, ledger #1875)
+//!
+//! `PROPFIND` (RFC 4918 §9.1) and `REPORT` (RFC 3253 §3.6) are what CalDAV and
+//! CardDAV are built on: listing a calendar home, a `calendar-query` (RFC 4791), an
+//! RFC 6578 `sync-collection`. Both are safe methods that carry an XML request
+//! body, so they resolve with `sink` (the verb that takes `content=`) and are
+//! **uncacheable**, but they are not writes: a success does NOT cut the URL's golden
+//! thread, so a cached `GET` of the same URL stays cached. The `Depth` header goes
+//! through `headers=` (`headers="Depth: 1"`); there is no separate argument. A
+//! `207 Multi-Status` is a success and its body passes through with the origin's
+//! `Content-Type`. Like the mutating methods they **never follow a redirect**: a
+//! 3xx with a `Location` is a typed error naming the target, so the request body is
+//! never replayed at an authority the caller did not vet. The capability ACL is the
+//! same `urn:cap:net:<host>` check as every other method.
+//!
+//! ```
+//! use ikigai_http::Method;
+//! assert_eq!(Method::Propfind.as_str(), "PROPFIND");
+//! assert_eq!(Method::Propfind.iri(), "urn:http:propfind");
+//! assert_eq!(Method::Report.id(), "http-report");
+//! assert!(!Method::Report.is_cacheable() && !Method::Report.is_mutating());
+//! ```
 //!
 //! ## Deprecated names (removed in 0.3.0)
 //!
@@ -72,10 +97,10 @@
 //! would let a granted host 302 the request to an ungranted one — the classic
 //! SSRF-via-redirect). For cacheable methods (`GET`/`HEAD`) the endpoint follows
 //! up to 5 hops, re-running the capability ACL against **each** hop's host, port
-//! and path — a redirect to an ungranted authority is a typed `Denied`. Mutating
-//! methods never follow a redirect (no cross-host replay of a request body): a
-//! 3xx with a `Location` on `POST`/`PUT`/`PATCH`/`DELETE` is a typed error
-//! naming the target instead.
+//! and path — a redirect to an ungranted authority is a typed `Denied`. Every
+//! other method sends a body and never follows a redirect (no cross-host replay of
+//! a request body): a 3xx with a `Location` on `POST`/`PUT`/`PATCH`/`DELETE`/
+//! `PROPFIND`/`REPORT` is a typed error naming the target instead.
 //!
 //! The credential to authenticate with (when one is needed) is itself meant to be
 //! capability-gated — the agent gets "may call host X with credential Y", never the
@@ -157,6 +182,10 @@ pub enum Method {
     Put,
     Patch,
     Delete,
+    /// WebDAV `PROPFIND` (RFC 4918): safe, carries an XML body, never cached.
+    Propfind,
+    /// WebDAV `REPORT` (RFC 3253): safe, carries an XML body, never cached.
+    Report,
 }
 
 impl Method {
@@ -169,28 +198,36 @@ impl Method {
             Method::Put => "PUT",
             Method::Patch => "PATCH",
             Method::Delete => "DELETE",
+            Method::Propfind => "PROPFIND",
+            Method::Report => "REPORT",
         }
     }
 
     /// The ROC verb this method is resolved with — chosen so the verb's
-    /// cacheability matches the method's idempotency.
+    /// cacheability matches the method's idempotency. `PROPFIND` and `REPORT` are
+    /// safe but carry a request body and must not be cached, so they take `Sink`,
+    /// the verb that receives `content=`.
     pub fn verb(self) -> Verb {
         match self {
             Method::Get => Verb::Source,
             Method::Head => Verb::Exists,
-            Method::Post | Method::Put | Method::Patch => Verb::Sink,
+            Method::Post | Method::Put | Method::Patch | Method::Propfind | Method::Report => {
+                Verb::Sink
+            }
             Method::Delete => Verb::Delete,
         }
     }
 
     /// Every method, in the order [`space`] binds them.
-    pub const ALL: [Method; 6] = [
+    pub const ALL: [Method; 8] = [
         Method::Get,
         Method::Head,
         Method::Post,
         Method::Put,
         Method::Patch,
         Method::Delete,
+        Method::Propfind,
+        Method::Report,
     ];
 
     /// The conventional IRI this method binds at: `urn:http:` plus the method,
@@ -203,11 +240,17 @@ impl Method {
             Method::Put => "urn:http:put",
             Method::Patch => "urn:http:patch",
             Method::Delete => "urn:http:delete",
+            Method::Propfind => "urn:http:propfind",
+            Method::Report => "urn:http:report",
         }
     }
 
     /// The pre-0.2.0 IRI, kept bound as a deprecated alias of [`iri`](Self::iri)
     /// through the 0.2.x line and removed in 0.3.0. See [`deprecated_aliases`].
+    ///
+    /// `PROPFIND` and `REPORT` arrived in 0.2.2 and never had an old name, so for
+    /// them this is [`iri`](Self::iri) itself, and [`deprecated_aliases`] has no
+    /// rule for them ([`has_deprecated_iri`](Self::has_deprecated_iri) is `false`).
     pub fn deprecated_iri(self) -> &'static str {
         match self {
             Method::Get => "urn:httpGet",
@@ -216,13 +259,20 @@ impl Method {
             Method::Put => "urn:httpPut",
             Method::Patch => "urn:httpPatch",
             Method::Delete => "urn:httpDelete",
+            Method::Propfind | Method::Report => self.iri(),
         }
+    }
+
+    /// Whether this method has a pre-0.2.0 name bound as a deprecated alias: the
+    /// original six do, `PROPFIND` and `REPORT` (0.2.2) do not.
+    pub fn has_deprecated_iri(self) -> bool {
+        self.deprecated_iri() != self.iri()
     }
 
     /// The endpoint's description id: a kebab-case noun, the one the MCP
     /// projection turns into an agent's tool name. UNIQUE per method, so the
     /// catalog subject (`urn:ikigai:endpoint:{id}`) and any projection keyed on it
-    /// don't collide across the six method endpoints.
+    /// don't collide across the method endpoints.
     pub fn id(self) -> &'static str {
         match self {
             Method::Get => "http-get",
@@ -231,6 +281,8 @@ impl Method {
             Method::Put => "http-put",
             Method::Patch => "http-patch",
             Method::Delete => "http-delete",
+            Method::Propfind => "http-propfind",
+            Method::Report => "http-report",
         }
     }
 
@@ -240,11 +292,19 @@ impl Method {
     }
 
     /// Whether this method mutates the target (and so should cut its URL thread).
+    /// `PROPFIND` and `REPORT` are safe methods: they carry a body but change
+    /// nothing, so they are not mutating and cut no thread.
     pub fn is_mutating(self) -> bool {
         matches!(
             self,
             Method::Post | Method::Put | Method::Patch | Method::Delete
         )
+    }
+
+    /// Whether the endpoint sends `content=` as the request body: every method
+    /// but `GET` and `HEAD`. A method that sends a body never follows a redirect.
+    fn sends_body(self) -> bool {
+        !self.is_cacheable()
     }
 }
 
@@ -423,7 +483,7 @@ impl Endpoint for HttpEndpoint {
         // identity (and so the cache key) is the URL the caller named.
         let thread = url_thread(&parsed);
 
-        let body = if self.method.is_mutating() {
+        let body = if self.method.sends_body() {
             inv.inline_arg("content")
                 .map(<[u8]>::to_vec)
                 .unwrap_or_default()
@@ -481,12 +541,12 @@ impl Endpoint for HttpEndpoint {
             let Some(location) = response.header("location") else {
                 break response; // a 3xx with nowhere to go is just a response
             };
-            if self.method.is_mutating() {
+            if self.method.sends_body() {
                 // Never replay a request body at a redirect target — the target
                 // may be a different authority than the one the caller vetted.
                 return Err(Error::Endpoint(format!(
-                    "HTTP {} redirect on {} not followed (mutating methods never \
-                     follow redirects); Location: {location}",
+                    "HTTP {} redirect on {} not followed (methods that send a body \
+                     never follow redirects); Location: {location}",
                     response.status,
                     self.method.as_str()
                 )));
@@ -555,6 +615,16 @@ impl Endpoint for HttpEndpoint {
         let summary = if self.method == Method::Head {
             "Ask whether a URL is present (`true`/`false`) with an HTTP HEAD through a host \
              transport, capability-gated by `urn:cap:net`."
+        } else if self.method == Method::Propfind {
+            "Send a WebDAV PROPFIND (RFC 4918) to a URL through a host transport, \
+             capability-gated by `urn:cap:net`: `content` is the XML request, `Depth` goes in \
+             `headers=`; never cached, never follows a redirect, and a 207 Multi-Status is \
+             the result."
+        } else if self.method == Method::Report {
+            "Send a WebDAV REPORT (RFC 3253; CalDAV calendar-query, RFC 6578 sync-collection) \
+             to a URL through a host transport, capability-gated by `urn:cap:net`: `content` \
+             is the XML request, `Depth` goes in `headers=`; never cached, never follows a \
+             redirect, and a 207 Multi-Status is the result."
         } else {
             "Dereference a URL as a resource through a host transport, capability-gated by \
              `urn:cap:net`; the origin's Content-Type labels the result."
@@ -609,7 +679,7 @@ impl Endpoint for HttpEndpoint {
                     ),
             );
         }
-        if self.method.is_mutating() {
+        if self.method.sends_body() {
             description = description
                 // The body is bytes of whatever type `content_type` says — a PNG is
                 // a valid body. `xsd:string` is the type the WIRE carries (a piped
@@ -621,12 +691,13 @@ impl Endpoint for HttpEndpoint {
     }
 }
 
-/// Mount all six HTTP-method endpoints on one host transport: `urn:http:get`,
+/// Mount all eight HTTP-method endpoints on one host transport: `urn:http:get`,
 /// `urn:http:head`, `urn:http:post`, `urn:http:put`, `urn:http:patch`,
-/// `urn:http:delete`, plus the six pre-0.2.0 names (`urn:httpGet` …) as deprecated
-/// aliases of them, through 0.2.x only (see [`deprecated_aliases`]).
+/// `urn:http:delete`, `urn:http:propfind`, `urn:http:report`, plus the six pre-0.2.0
+/// names (`urn:httpGet` … `urn:httpDelete`) as deprecated aliases of the first six,
+/// through 0.2.x only (see [`deprecated_aliases`]).
 ///
-/// The space is an [`Alias`] over the six bindings ([`endpoints`]): the overlay
+/// The space is an [`Alias`] over the eight bindings ([`endpoints`]): the overlay
 /// core provides for exactly this migration, so an old name shares its new name's
 /// cache entry and golden thread, describes itself by the new id, and is absent
 /// from the catalog. Hold it as an `Arc<dyn Space>`: in 0.3.0, when the aliases
@@ -658,7 +729,7 @@ pub fn space(transport: Arc<dyn HttpTransport>) -> Alias {
     )
 }
 
-/// The six HTTP-method endpoints bound at their names, with no aliases: what
+/// The eight HTTP-method endpoints bound at their names, with no aliases: what
 /// [`space`] wraps. For a host that has migrated every caller and wants the old
 /// names to miss now rather than in 0.3.0.
 pub fn endpoints(transport: Arc<dyn HttpTransport>) -> EndpointSpace {
@@ -672,8 +743,9 @@ pub fn endpoints(transport: Arc<dyn HttpTransport>) -> EndpointSpace {
     space
 }
 
-/// The deprecated pre-0.2.0 names as an alias table: one exact rule per method,
-/// `urn:httpGet` → `urn:http:get` and likewise for the other five. [`space`] already
+/// The deprecated pre-0.2.0 names as an alias table: one exact rule per original
+/// method, `urn:httpGet` → `urn:http:get` and likewise for the other five
+/// (`PROPFIND` and `REPORT` never had an old name, so they get none). [`space`] already
 /// applies it. A host that also wants the rules in the kernel's own hands (the
 /// readout and per-rule counters at `urn:kernel:aliases`, which show whether
 /// anything still calls an old name) installs the same table with
@@ -682,6 +754,7 @@ pub fn endpoints(transport: Arc<dyn HttpTransport>) -> EndpointSpace {
 pub fn deprecated_aliases() -> AliasTable {
     Method::ALL
         .into_iter()
+        .filter(|method| method.has_deprecated_iri())
         .fold(AliasTable::new(), |table, method| {
             table.exact(method.deprecated_iri(), method.iri())
         })
@@ -1187,13 +1260,24 @@ mod tests {
             .iter()
             .map(|r| (r.kind(), r.from(), r.to()))
             .collect();
-        for method in Method::ALL {
+        for method in Method::ALL.into_iter().filter(|m| m.has_deprecated_iri()) {
             assert!(
                 rules.contains(&(RuleKind::Exact, method.deprecated_iri(), method.iri())),
                 "{method:?}: {rules:?}"
             );
         }
-        assert_eq!(rules.len(), Method::ALL.len(), "{rules:?}");
+        // Six rules: the original six methods. PROPFIND and REPORT (0.2.2) never had
+        // an old name, and no rule may point at, or come from, one of them.
+        assert_eq!(rules.len(), 6, "{rules:?}");
+        for method in [Method::Propfind, Method::Report] {
+            assert!(!method.has_deprecated_iri(), "{method:?}");
+            assert!(
+                rules
+                    .iter()
+                    .all(|(_, from, to)| *from != method.iri() && *to != method.iri()),
+                "{method:?}: {rules:?}"
+            );
+        }
 
         let space = Arc::new(space(Arc::new(Mock::new(resp(None)))));
         let kernel = Kernel::new(space.clone());
@@ -1581,5 +1665,259 @@ mod tests {
             "https://a.example.com/moved",
             "a relative Location joins the current URL"
         );
+    }
+
+    // --- WebDAV: PROPFIND and REPORT (ledger #1875) -------------------------
+
+    /// A transport that records every request it receives and answers each with
+    /// the same response.
+    struct Record {
+        requests: std::sync::Mutex<Vec<HttpRequest>>,
+        response: HttpResponse,
+    }
+    impl Record {
+        fn new(response: HttpResponse) -> Arc<Self> {
+            Arc::new(Record {
+                requests: std::sync::Mutex::new(Vec::new()),
+                response,
+            })
+        }
+        fn requests(&self) -> Vec<HttpRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl HttpTransport for Record {
+        async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            self.requests.lock().unwrap().push(request);
+            Ok(self.response.clone())
+        }
+    }
+
+    fn multistatus() -> HttpResponse {
+        HttpResponse {
+            status: 207,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/xml; charset=utf-8".to_string(),
+            )],
+            body: b"<d:multistatus xmlns:d=\"DAV:\"/>".to_vec(),
+        }
+    }
+
+    const PROPFIND_BODY: &str =
+        "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:displayname/></d:prop></d:propfind>";
+
+    fn dav(method: Method, url: &str) -> Request {
+        Request::new(Verb::Sink, Iri::parse(method.iri()).unwrap())
+            .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+            .with_arg("content", ArgRef::Inline(PROPFIND_BODY.as_bytes().to_vec()))
+            .with_arg(
+                "content_type",
+                ArgRef::Inline(b"application/xml; charset=utf-8".to_vec()),
+            )
+            .with_arg("headers", ArgRef::Inline(b"Depth: 1".to_vec()))
+    }
+
+    #[test]
+    fn propfind_and_report_are_safe_body_carrying_sinks() {
+        for (method, token, iri, id) in [
+            (
+                Method::Propfind,
+                "PROPFIND",
+                "urn:http:propfind",
+                "http-propfind",
+            ),
+            (Method::Report, "REPORT", "urn:http:report", "http-report"),
+        ] {
+            assert_eq!(method.as_str(), token);
+            assert_eq!(method.iri(), iri);
+            assert_eq!(method.id(), id);
+            assert_eq!(
+                method.verb(),
+                Verb::Sink,
+                "{token}: the verb that takes content="
+            );
+            assert!(!method.is_cacheable(), "{token}: never cached");
+            assert!(
+                !method.is_mutating(),
+                "{token}: a safe method cuts no thread"
+            );
+            assert!(method.sends_body(), "{token}: content= is the body");
+            assert!(Method::ALL.contains(&method), "{token}: bound by space()");
+        }
+    }
+
+    /// The method token, the XML body, `Content-Type` and the `Depth` header from
+    /// `headers=` all reach the transport, and a 207 Multi-Status is the result,
+    /// passed through with the origin's bare media type.
+    #[test]
+    fn propfind_and_report_send_method_body_and_depth_and_return_the_multistatus() {
+        for method in [Method::Propfind, Method::Report] {
+            let transport = Record::new(multistatus());
+            let kernel = Kernel::new(Arc::new(space(transport.clone())));
+            let out = futures::executor::block_on(kernel.issue(
+                dav(method, "https://dav.example.com/cal/"),
+                &Capability::root(),
+            ))
+            .unwrap_or_else(|e| panic!("{method:?}: {e}"));
+            assert_eq!(
+                out.bytes, b"<d:multistatus xmlns:d=\"DAV:\"/>",
+                "{method:?}"
+            );
+            assert_eq!(out.repr_type.media_type, "application/xml", "{method:?}");
+
+            let sent = transport.requests();
+            assert_eq!(sent.len(), 1, "{method:?}");
+            let sent = &sent[0];
+            assert_eq!(sent.method, method);
+            assert_eq!(sent.method.as_str(), method.as_str());
+            assert_eq!(sent.url, "https://dav.example.com/cal/");
+            assert_eq!(sent.body, PROPFIND_BODY.as_bytes(), "{method:?}: the body");
+            assert!(
+                sent.headers
+                    .contains(&("Depth".to_string(), "1".to_string())),
+                "{method:?}: {:?}",
+                sent.headers
+            );
+            assert!(
+                sent.headers.contains(&(
+                    "Content-Type".to_string(),
+                    "application/xml; charset=utf-8".to_string()
+                )),
+                "{method:?}: {:?}",
+                sent.headers
+            );
+        }
+    }
+
+    /// Never cached: the same PROPFIND twice reaches the wire twice, even on a
+    /// clocked kernel with a caller `max_age` and an origin `max-age`.
+    #[test]
+    fn propfind_and_report_are_never_cached() {
+        for method in [Method::Propfind, Method::Report] {
+            let mut response = multistatus();
+            response
+                .headers
+                .push(("Cache-Control".to_string(), "max-age=600".to_string()));
+            let transport = Record::new(response);
+            let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                .with_clock(Arc::new(TestClock::at(0)));
+            for _ in 0..2 {
+                let req = dav(method, "https://dav.example.com/cal/")
+                    .with_arg("max_age", ArgRef::Inline(b"600".to_vec()));
+                futures::executor::block_on(kernel.issue(req, &Capability::root())).unwrap();
+            }
+            assert_eq!(transport.requests().len(), 2, "{method:?}");
+        }
+    }
+
+    /// A safe method is not a write: a PROPFIND or REPORT to a URL leaves a cached
+    /// GET of that URL cached, where a POST would have cut it.
+    #[test]
+    fn propfind_and_report_do_not_cut_the_url_thread() {
+        for method in [Method::Propfind, Method::Report] {
+            let transport = Arc::new(Mock::new(resp(Some("max-age=600"))));
+            let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                .with_clock(Arc::new(TestClock::at(0)));
+            let cap = Capability::root();
+            let url = "https://example.com/x";
+            futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
+            futures::executor::block_on(kernel.issue(dav(method, url), &cap)).unwrap();
+            futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
+            assert_eq!(
+                transport.gets(),
+                1,
+                "{method:?}: the cached GET survived the safe method"
+            );
+        }
+    }
+
+    /// Never follows a redirect, even to a granted host and even under root: the
+    /// body is not replayed, and the error names the target.
+    #[test]
+    fn propfind_and_report_never_follow_redirects() {
+        for method in [Method::Propfind, Method::Report] {
+            for status in [301, 302, 303, 307, 308] {
+                let transport = Seq::new(vec![
+                    redirect_to(status, "https://a.example.com/elsewhere/"),
+                    multistatus(),
+                ]);
+                let kernel = Kernel::new(Arc::new(space(transport.clone())));
+                let err = futures::executor::block_on(kernel.issue(
+                    dav(method, "https://a.example.com/cal/"),
+                    &Capability::root(),
+                ))
+                .unwrap_err();
+                assert!(
+                    matches!(err, Error::Endpoint(_)),
+                    "{method:?} {status}: {err:?}"
+                );
+                let text = err.to_string();
+                assert!(
+                    text.contains("never follow redirects")
+                        && text.contains(method.as_str())
+                        && text.contains("https://a.example.com/elsewhere/"),
+                    "{method:?} {status}: {text}"
+                );
+                assert_eq!(
+                    transport.urls().len(),
+                    1,
+                    "{method:?} {status}: one request"
+                );
+            }
+        }
+    }
+
+    /// The same capability ACL as every other method: an ungranted host, or a
+    /// denied path on a granted host, is a typed `Denied` before any I/O; a granted
+    /// one is sent.
+    #[test]
+    fn propfind_and_report_are_gated_by_the_net_acl() {
+        let cap = Capability::scoped([
+            "urn:cap:net:dav.example.com",
+            "urn:cap:net:-dav.example.com/private",
+        ]);
+        for method in [Method::Propfind, Method::Report] {
+            for url in [
+                "https://other.example.com/cal/",
+                "https://dav.example.com/private/cal/",
+            ] {
+                let transport = Record::new(multistatus());
+                let ep = HttpEndpoint::new(method, transport.clone());
+                let req = dav(method, url);
+                let bindings = ikigai_core::Bindings::new();
+                let inv = Invocation::detached(&req, &bindings, &cap);
+                let err = futures::executor::block_on(ep.invoke(&inv)).unwrap_err();
+                assert!(matches!(err, Error::Denied(_)), "{method:?} {url}: {err:?}");
+                assert!(!err.is_transient(), "{method:?} {url}");
+                assert!(err.to_string().contains(method.as_str()), "{err}");
+                assert!(transport.requests().is_empty(), "{method:?} {url}: no I/O");
+            }
+            let transport = Record::new(multistatus());
+            let ep = HttpEndpoint::new(method, transport.clone());
+            let req = dav(method, "https://dav.example.com/cal/");
+            let bindings = ikigai_core::Bindings::new();
+            let inv = Invocation::detached(&req, &bindings, &cap);
+            futures::executor::block_on(ep.invoke(&inv)).unwrap();
+            assert_eq!(transport.requests().len(), 1, "{method:?}: granted");
+        }
+    }
+
+    /// An error status maps onto the same typed taxonomy as every other method.
+    #[test]
+    fn propfind_maps_status_onto_the_typed_error_taxonomy() {
+        let result = |status: u16| {
+            let kernel = Kernel::new(Arc::new(space(Status::new(status, None))));
+            futures::executor::block_on(kernel.issue(
+                dav(Method::Propfind, "https://dav.example.com/cal/"),
+                &Capability::root(),
+            ))
+        };
+        assert!(result(207).is_ok());
+        assert!(matches!(result(404).unwrap_err(), Error::NotFound(_)));
+        assert!(matches!(result(401).unwrap_err(), Error::Denied(_)));
+        assert!(matches!(result(503).unwrap_err(), Error::Unavailable(_)));
+        assert!(matches!(result(422).unwrap_err(), Error::Endpoint(_)));
     }
 }
