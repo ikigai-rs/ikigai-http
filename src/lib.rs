@@ -47,7 +47,7 @@
 //! assert!(!Method::Report.is_cacheable() && !Method::Report.is_mutating());
 //! ```
 //!
-//! ## Deprecated names (removed in 0.3.0)
+//! ## Deprecated names (still bound in 0.3.x)
 //!
 //! Through 0.1.x the six bound at `urn:httpGet` … `urn:httpDelete` with ids
 //! `httpGet` … `httpDelete`. 0.2.0 renamed them to the kebab-case convention
@@ -58,6 +58,12 @@
 //! backing description (id `http-get`, not `httpGet`), and only the new names in
 //! the catalog. The old ids are NOT kept: an id is a name, not an IRI, and nothing
 //! resolves by it, so an agent's MCP tool names move with this release.
+//!
+//! They were due to go in 0.3.0 and **stay bound through 0.3.x**: when 0.3.0 was cut
+//! (ledger #1546), callers still named them (ikigai-runbook's demo commands, the
+//! `RateLimit` example in ikigai-throttle's docs), and removing a name breaks its
+//! callers at run time, never at compile time. Their removal is a later minor of its
+//! own, once those have moved; `urn:kernel:aliases` counts what still calls them.
 //!
 //! ```
 //! use ikigai_http::Method;
@@ -121,16 +127,31 @@
 //! assert_eq!(ikigai_http::base64::decode(auth.credentials()).unwrap(), b"Aladdin:open sesame");
 //! ```
 //!
-//! ## Honest status (needs `ikigai-core` ≥ 0.1.47)
+//! ## Honest status: one table (0.3.0, needs `ikigai-core` ≥ 0.1.108)
 //!
 //! The endpoint reports what HTTP said, mapped onto the typed-error taxonomy — it never hands
 //! back a `404` error page dressed up as the resource. It is **policy-free**: the caller decides
-//! what a status *means* for its purpose.
+//! what a status *means* for its purpose. The mapping is ONE public table, [`status`], which
+//! every module that talks HTTP calls instead of keeping a copy; each error's
+//! [`class`](ikigai_core::Error::class) (core's) says who may repeat it.
 //!
-//! - `GET`/`source` (and the mutating verbs): 2xx → the representation; 404/410 → `NotFound`;
-//!   401/403 → `Denied`; 408/504 → `Timeout`; 429/5xx → `Unavailable`; other 4xx → `Endpoint`.
-//!   A transport-level failure (DNS/refused/timeout) is `Unavailable`. Because the mapping lands
-//!   on the taxonomy, `is_transient` drives the retry/circuit-breaker/failover overlays for free.
+//! - `GET`/`source` (and every method that sends a body): 2xx → the representation; 404/410 →
+//!   `NotFound`; **401/403 → `Refused`** (an origin refused our credential; `Denied` stays the
+//!   capability floor's word); 408/504 → `Timeout`; 409/412 → `Conflict`; 413/414/431 →
+//!   `OverBudget`; **429 → `RetryAfter`**, its delay from `Retry-After` (delay-seconds, or an
+//!   HTTP-date on the kernel's clock); 503 → `RetryAfter` with a usable `Retry-After`, else
+//!   `Unavailable`; 502 → `Unavailable`; 501 → `Unsupported`; **500 and every other 5xx →
+//!   `Endpoint`** (unknown, not transient); any other status → `Endpoint`.
+//! - A transport-level failure is `Timeout` when the transport says it timed out, else
+//!   `Unavailable` ([`status::transport_error`]). Each action declares these classes
+//!   ([`Description::fails`]), so the manifold says what can go wrong before anything does.
+//!
+//! ```
+//! use ikigai_core::{Error, FailureClass};
+//! let refused = ikigai_http::status::status_error(401, None, "HTTP 401").unwrap();
+//! assert!(matches!(refused, Error::Refused(_)));
+//! assert_eq!(refused.class(), FailureClass::Refused);
+//! ```
 //! - `HEAD`/`exists`: a `"true"`/`"false"` text representation, following the `ikigai-fs` `Exists`
 //!   convention (existence is an answer, not an error). Existence is **lenient**: the check is only
 //!   reached once the server has answered, so any status but 404/410 means the host is reachable and
@@ -159,12 +180,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ikigai_core::{
     Alias, AliasTable, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact,
-    Invocation, Iri, ReprType, Representation, Request, Result, Verb,
+    FailureClass, Invocation, Iri, ReprType, Representation, Request, Result, Verb,
 };
 use url::Url;
 
 pub mod auth;
 pub mod base64;
+pub mod status;
 
 /// The XSD datatypes the inputs declare: the URL is an IRI, a header value is a
 /// string, a freshness window is a count of seconds.
@@ -246,7 +268,7 @@ impl Method {
     }
 
     /// The pre-0.2.0 IRI, kept bound as a deprecated alias of [`iri`](Self::iri)
-    /// through the 0.2.x line and removed in 0.3.0. See [`deprecated_aliases`].
+    /// through the 0.3.x line, and removed in a later minor. See [`deprecated_aliases`].
     ///
     /// `PROPFIND` and `REPORT` arrived in 0.2.2 and never had an old name, so for
     /// them this is [`iri`](Self::iri) itself, and [`deprecated_aliases`] has no
@@ -522,18 +544,22 @@ impl Endpoint for HttpEndpoint {
                 )));
             }
 
+            let target = current.to_string();
             let response = self
                 .transport
                 .send(HttpRequest {
                     method: self.method,
-                    url: current.to_string(),
+                    url: target.clone(),
                     headers: headers.clone(),
                     body: body.clone(),
                 })
                 .await
-                // A transport-level failure (DNS, connection refused, timeout, TLS) is a network
-                // fault → transient `Unavailable`, so Retry/CircuitBreaker/Failover overlays act on it.
-                .map_err(|e| Error::Unavailable(format!("http transport: {e}")))?;
+                // A transport-level failure is a network fault, transient either way: a
+                // `Timeout` when the transport gave up waiting (a wait on the origin, not a
+                // bound of ours), else `Unavailable` (DNS, refused, TLS, dropped).
+                .map_err(|e| {
+                    status::transport_error(&e, &target, format!("http transport: {e}"))
+                })?;
 
             if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 break response;
@@ -581,8 +607,13 @@ impl Endpoint for HttpEndpoint {
         }
 
         // Every other method returns a representation on success and a **typed error** on a
-        // non-success status — never the error-page body dressed up as the resource.
-        source_outcome(response.status)?;
+        // non-success status — never the error-page body dressed up as the resource. The one
+        // table ([`status`]); a `Retry-After` HTTP-date is read on the kernel's clock.
+        if let Some(err) =
+            status::response_error(&response, inv.now(), format!("HTTP {}", response.status))
+        {
+            return Err(err);
+        }
 
         // A *successful* mutating method invalidates any cached representation of the same URL by
         // cutting its thread through the kernel (so it works the same over the wire; needs
@@ -679,6 +710,20 @@ impl Endpoint for HttpEndpoint {
                     ),
             );
         }
+        // The failure classes each action can produce beyond the implied ones (permanent
+        // always; denied, since it `requires` a scope). HEAD's existence check is lenient: an
+        // answered status is `true`/`false`, so only a transport failure (transient) or a
+        // redirect it cannot follow (unknown) is an error. Every other method can see the
+        // whole status table.
+        description = description
+            .fails(FailureClass::Transient)
+            .fails(FailureClass::Unknown);
+        if self.method != Method::Head {
+            description = description
+                .fails(FailureClass::RetryAfter)
+                .fails(FailureClass::OverBudget)
+                .fails(FailureClass::Refused);
+        }
         if self.method.sends_body() {
             description = description
                 // The body is bytes of whatever type `content_type` says — a PNG is
@@ -695,13 +740,13 @@ impl Endpoint for HttpEndpoint {
 /// `urn:http:head`, `urn:http:post`, `urn:http:put`, `urn:http:patch`,
 /// `urn:http:delete`, `urn:http:propfind`, `urn:http:report`, plus the six pre-0.2.0
 /// names (`urn:httpGet` … `urn:httpDelete`) as deprecated aliases of the first six,
-/// through 0.2.x only (see [`deprecated_aliases`]).
+/// through 0.3.x (see [`deprecated_aliases`]).
 ///
 /// The space is an [`Alias`] over the eight bindings ([`endpoints`]): the overlay
 /// core provides for exactly this migration, so an old name shares its new name's
 /// cache entry and golden thread, describes itself by the new id, and is absent
-/// from the catalog. Hold it as an `Arc<dyn Space>`: in 0.3.0, when the aliases
-/// go, this returns the [`EndpointSpace`] again.
+/// from the catalog. Hold it as an `Arc<dyn Space>`: in the minor that removes the
+/// aliases, this returns the [`EndpointSpace`] again.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -731,7 +776,7 @@ pub fn space(transport: Arc<dyn HttpTransport>) -> Alias {
 
 /// The eight HTTP-method endpoints bound at their names, with no aliases: what
 /// [`space`] wraps. For a host that has migrated every caller and wants the old
-/// names to miss now rather than in 0.3.0.
+/// names to miss now rather than when the aliases are removed.
 pub fn endpoints(transport: Arc<dyn HttpTransport>) -> EndpointSpace {
     let mut space = EndpointSpace::new();
     for method in Method::ALL {
@@ -750,7 +795,7 @@ pub fn endpoints(transport: Arc<dyn HttpTransport>) -> EndpointSpace {
 /// readout and per-rule counters at `urn:kernel:aliases`, which show whether
 /// anything still calls an old name) installs the same table with
 /// `Kernel::with_aliases`; the two compose, since a canonical name matches no rule.
-/// Removed in 0.3.0.
+/// Kept through 0.3.x; removed in a later minor.
 pub fn deprecated_aliases() -> AliasTable {
     Method::ALL
         .into_iter()
@@ -812,29 +857,13 @@ fn request_headers(inv: &Invocation<'_>) -> Vec<(String, String)> {
     headers
 }
 
-/// The ROC outcome for a representation-returning resolve from an HTTP status: `Ok(())` on a
-/// success (2xx, or a 3xx the transport didn't follow), else a **typed error** mapped onto the
-/// taxonomy so `is_transient` drives the retry/circuit-breaker overlays correctly. The module is
-/// policy-free — it reports what HTTP said; the caller decides what it means.
-fn source_outcome(status: u16) -> Result<()> {
-    match status {
-        200..=399 => Ok(()),
-        404 | 410 => Err(Error::NotFound(format!("HTTP {status}"))),
-        401 | 403 => Err(Error::Denied(format!("HTTP {status}"))),
-        408 | 504 => Err(Error::Timeout(format!("HTTP {status}"))),
-        429 => Err(Error::Unavailable(format!("HTTP {status}"))),
-        500..=599 => Err(Error::Unavailable(format!("HTTP {status}"))),
-        _ => Err(Error::Endpoint(format!("HTTP {status}"))),
-    }
-}
-
 /// The existence outcome for a HEAD from an HTTP status. `exists_outcome` is only reached once the
 /// server has **answered** (a transport failure errors before this), so any status it sees is proof
 /// the host is reachable. Existence is therefore lenient: **only 404/410 are *absent*** (`false`);
 /// every other answer — including a 429 throttle, a 5xx server error, or a 408/504 timeout — means
 /// the endpoint is *there*, just busy or gated, and is *present* (`true`).
 ///
-/// This is deliberately more lenient than `source_outcome`: `Exists` asks "is it there?" and a
+/// This is deliberately more lenient than the [`status`] table a `GET` reads: `Exists` asks "is it there?" and a
 /// server that responds at all answers yes (bar a definitive gone); `Source` asks "give it to me"
 /// and a 429/5xx is a real, honestly-typed transient failure. The split matters for callers like a
 /// link-checker: a bookmark whose host answers `429`/`503` (rate-limited or briefly down, e.g.
@@ -1188,7 +1217,7 @@ mod tests {
         assert_eq!(transport.gets(), 2, "GET recomputed after the mutating cut");
     }
 
-    // --- Deprecated names (0.2.x only; removed in 0.3.0) -------------------
+    // --- Deprecated names (kept through 0.3.x; removed in a later minor) ---
 
     fn get_at(iri: &str, url: &str) -> Request {
         Request::new(Verb::Source, Iri::parse(iri).unwrap())
@@ -1381,28 +1410,194 @@ mod tests {
             .map(|r| String::from_utf8(r.bytes).unwrap())
     }
 
+    /// The endpoint answers through the one table ([`status`]), whose own tests cover every
+    /// row; this pins that a GET reaches it, and the rows 0.3.0 changed.
     #[test]
     fn get_maps_status_onto_the_typed_error_taxonomy() {
         assert!(get_result(200).is_ok(), "2xx is a representation");
         assert!(matches!(get_result(404).unwrap_err(), Error::NotFound(_)));
         assert!(matches!(get_result(410).unwrap_err(), Error::NotFound(_)));
-        assert!(matches!(get_result(401).unwrap_err(), Error::Denied(_)));
-        assert!(matches!(get_result(403).unwrap_err(), Error::Denied(_)));
+        // 0.3.0: an origin's 401/403 is `Refused` (was `Denied`).
+        for status in [401, 403] {
+            let err = get_result(status).unwrap_err();
+            assert!(matches!(err, Error::Refused(_)), "{status}: {err:?}");
+            assert_eq!(err.class(), FailureClass::Refused);
+            assert_eq!(err.to_string(), format!("refused: HTTP {status}"));
+        }
+        assert!(matches!(get_result(408).unwrap_err(), Error::Timeout(_)));
         assert!(matches!(get_result(504).unwrap_err(), Error::Timeout(_)));
-        // 429 and 5xx are transient — the retry overlays should act on them.
-        let e503 = get_result(503).unwrap_err();
-        assert!(matches!(e503, Error::Unavailable(_)) && e503.is_transient());
+        // 502 and a 503 without Retry-After stay transient.
+        for status in [502, 503] {
+            let err = get_result(status).unwrap_err();
+            assert!(
+                matches!(err, Error::Unavailable(_)) && err.is_transient(),
+                "{status}"
+            );
+        }
+        // 0.3.0: a 500 (and any unnamed 5xx) is `Endpoint`, unknown, not transient (was
+        // `Unavailable`).
+        for status in [500, 505] {
+            let err = get_result(status).unwrap_err();
+            assert!(matches!(err, Error::Endpoint(_)), "{status}: {err:?}");
+            assert!(!err.is_transient());
+            assert_eq!(err.class(), FailureClass::Unknown);
+        }
+        // 0.3.0: a 429 is `RetryAfter` (was `Unavailable`), and NOT transient: an overlay
+        // built before the variant existed treats it as permanent.
+        let e429 = get_result(429).unwrap_err();
+        assert!(
+            matches!(e429, Error::RetryAfter { delay: None, .. }),
+            "{e429:?}"
+        );
+        assert!(!e429.is_transient());
+        // 0.3.0: 409/412 → Conflict, 413 → OverBudget, 501 → Unsupported (were Endpoint).
+        assert!(matches!(get_result(409).unwrap_err(), Error::Conflict(_)));
+        assert!(matches!(get_result(412).unwrap_err(), Error::Conflict(_)));
         assert!(matches!(
-            get_result(500).unwrap_err(),
-            Error::Unavailable(_)
+            get_result(413).unwrap_err(),
+            Error::OverBudget { .. }
         ));
         assert!(matches!(
-            get_result(429).unwrap_err(),
-            Error::Unavailable(_)
+            get_result(501).unwrap_err(),
+            Error::Unsupported { verb: None, .. }
         ));
         // A permanent client error we don't type specifically → Endpoint.
         let e422 = get_result(422).unwrap_err();
         assert!(matches!(e422, Error::Endpoint(_)) && !e422.is_transient());
+    }
+
+    /// A transport answering with a status and a `Retry-After` value.
+    struct RetryAfterOrigin {
+        status: u16,
+        retry_after: &'static str,
+    }
+    #[async_trait]
+    impl HttpTransport for RetryAfterOrigin {
+        async fn send(&self, _req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            Ok(HttpResponse {
+                status: self.status,
+                headers: vec![("Retry-After".to_string(), self.retry_after.to_string())],
+                body: Vec::new(),
+            })
+        }
+    }
+
+    /// The endpoint reads `Retry-After` in both forms, the HTTP-date on the KERNEL's
+    /// injected clock (not the wall clock), for a 429 and a 503 alike.
+    #[test]
+    fn a_get_reads_retry_after_in_both_forms_on_the_kernel_clock() {
+        // 2015-10-21T07:28:00Z, and a kernel clock 45 s before it.
+        let date = "Wed, 21 Oct 2015 07:28:00 GMT";
+        let clock = TestClock::at(1_445_412_480_000 - 45_000);
+        for (status, retry_after, want) in [
+            (429, "12", Some(12_000)),
+            (429, date, Some(45_000)),
+            (503, "12", Some(12_000)),
+            (503, date, Some(45_000)),
+            (429, "whenever", None),
+        ] {
+            let origin = Arc::new(RetryAfterOrigin {
+                status,
+                retry_after,
+            });
+            let kernel = Kernel::new(Arc::new(space(origin))).with_clock(Arc::new(clock.clone()));
+            let err = futures::executor::block_on(
+                kernel.issue(get("https://example.com/x"), &Capability::root()),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::RetryAfter { .. }),
+                "{status} {retry_after}: {err:?}"
+            );
+            assert_eq!(err.retry_after_millis(), want, "{status} {retry_after}");
+        }
+        // A 503 whose header does not parse is the ordinary transient Unavailable.
+        let origin = Arc::new(RetryAfterOrigin {
+            status: 503,
+            retry_after: "whenever",
+        });
+        let kernel = Kernel::new(Arc::new(space(origin))).with_clock(Arc::new(clock));
+        let err = futures::executor::block_on(
+            kernel.issue(get("https://example.com/x"), &Capability::root()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
+    }
+
+    /// Every action declares what it can fail with. HEAD sees no status as an error, so
+    /// it declares only the transport's transient failure and the unknown redirect
+    /// refusals; every other method can see the whole table.
+    #[test]
+    fn each_action_declares_its_failure_classes() {
+        let all = [
+            FailureClass::Transient,
+            FailureClass::RetryAfter,
+            FailureClass::OverBudget,
+            FailureClass::Refused,
+            FailureClass::Unknown,
+        ];
+        for method in Method::ALL {
+            let ep = HttpEndpoint::new(method, Arc::new(Mock::new(resp(None))));
+            let description = ep.describe();
+            let specs = description.action_specs();
+            assert_eq!(specs.len(), 1, "{method:?}");
+            let spec = &specs[0];
+            let expect: &[FailureClass] = if method == Method::Head {
+                &[FailureClass::Transient, FailureClass::Unknown]
+            } else {
+                &all
+            };
+            for class in all {
+                assert_eq!(
+                    spec.admits_failure(class),
+                    Some(expect.contains(&class)),
+                    "{method:?} {class:?}"
+                );
+            }
+            // Implied: permanent always, denied because the action requires a net scope.
+            assert_eq!(spec.admits_failure(FailureClass::Permanent), Some(true));
+            assert_eq!(spec.admits_failure(FailureClass::Denied), Some(true));
+        }
+    }
+
+    /// A transport that gave up waiting is `Timeout` (a wait on the origin), any other
+    /// transport failure `Unavailable`; both transient.
+    #[test]
+    fn a_transport_timeout_is_a_timeout() {
+        struct Slow;
+        #[async_trait]
+        impl HttpTransport for Slow {
+            async fn send(&self, _r: HttpRequest) -> std::result::Result<HttpResponse, String> {
+                Err("error sending request: operation timed out".into())
+            }
+        }
+        let kernel = Kernel::new(Arc::new(space(Arc::new(Slow))));
+        let err = futures::executor::block_on(
+            kernel.issue(get("https://example.com/x"), &Capability::root()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Timeout(_)) && err.is_transient(),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "timeout: http transport: error sending request: operation timed out"
+        );
+        // A URL that says "timeout" does not make a refusal one.
+        struct Refused;
+        #[async_trait]
+        impl HttpTransport for Refused {
+            async fn send(&self, r: HttpRequest) -> std::result::Result<HttpResponse, String> {
+                Err(format!("connection refused: {}", r.url))
+            }
+        }
+        let kernel = Kernel::new(Arc::new(space(Arc::new(Refused))));
+        let err = futures::executor::block_on(
+            kernel.issue(get("https://timeout.example/x"), &Capability::root()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Unavailable(_)), "{err:?}");
     }
 
     #[test]
@@ -1916,8 +2111,10 @@ mod tests {
         };
         assert!(result(207).is_ok());
         assert!(matches!(result(404).unwrap_err(), Error::NotFound(_)));
-        assert!(matches!(result(401).unwrap_err(), Error::Denied(_)));
+        assert!(matches!(result(401).unwrap_err(), Error::Refused(_)));
         assert!(matches!(result(503).unwrap_err(), Error::Unavailable(_)));
+        assert!(matches!(result(429).unwrap_err(), Error::RetryAfter { .. }));
+        assert!(matches!(result(500).unwrap_err(), Error::Endpoint(_)));
         assert!(matches!(result(422).unwrap_err(), Error::Endpoint(_)));
     }
 }

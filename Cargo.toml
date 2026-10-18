@@ -17,13 +17,14 @@ categories = ["web-programming::http-client", "wasm"]
 # this module needs: `Expiry::At` / `Representation::cacheable_until`, the injected
 # `Clock`, and `Invocation::now`.
 #
-# 0.1.86 is a SAFETY floor, not an API one (Error::NotFound, from 0.1.47, is the
-# newest API this crate calls). Through 0.1.85 `Capability::attenuate` and `clamp`
-# dropped a `urn:cap:net:-<rule>` exclusion that the requested or carried side did
-# not also name, so narrowing a host allow plus a path deny re-opened the denied
-# path. 0.1.86 keeps every exclusion through both (ledger #858);
-# `a_host_deny_survives_attenuate_and_clamp` fails below it.
-ikigai-core = "0.1.86"
+# 0.1.108 is the API floor (ledger #1546): the failure-class variants the status
+# table answers with (`Error::Refused`, `RetryAfter`, `OverBudget`, `Unsupported`),
+# `FailureClass` and `Error::class`, and `Description::fails`. Below it nothing here
+# compiles. (The older SAFETY floor, 0.1.86, is subsumed: through 0.1.85 `attenuate`
+# and `clamp` dropped a `urn:cap:net:-<rule>` exclusion, ledger #858, and
+# `a_host_deny_survives_attenuate_and_clamp` still pins it.) Read the caret as a
+# RANGE: `^0.1.108` admits every later 0.1.x, so no ceiling below the 0.1 line.
+ikigai-core = "0.1.108"
 async-trait = "0.1"
 # URL parsing (host/path extraction for the capability ACL); runtime-free.
 url = "2"
@@ -35,6 +36,13 @@ url = "2"
 # caret as a RANGE: `^0.22.0` is `<0.23.0`, a ceiling as well as a floor (field
 # guide rule 5). Pure Rust, no dependencies of its own, wasm-clean.
 base64 = "0.22.0"
+# `Retry-After`'s HTTP-date form (RFC 9110 §10.2.3, §5.6.7: IMF-fixdate plus the two
+# obsolete forms a recipient must accept), parsed by the vetted crate rather than by
+# hand (the field guide's "do not reimplement" rule). 1.0.3 is the version already
+# in ikigai-cli's graph (through hyper), so the main host links ONE copy; the API used,
+# `parse_http_date`, is 1.0's. No dependencies of its own; wasm-clean (it builds a
+# `SystemTime` from the epoch and never reads the wall clock).
+httpdate = "1.0.3"
 
 [dev-dependencies]
 futures = "0.3"
@@ -50,11 +58,9 @@ futures = "0.3"
 # promise). Read the caret as a RANGE: `^0.8.0` is `<0.9.0`, a ceiling as well as a
 # floor (field guide rule 5), so a 0.9 needs a deliberate bump here.
 #
-# Its own floor on ikigai-core (0.1.100) is above the library's, and every build
-# that compiles the test resolves to it; the test's `EndpointSpace::named` and
-# `space_iri` (0.1.89) ride on that edge. The library's pin above deliberately stays
-# the true minimum of what the LIBRARY uses, so this raise changes nothing a
-# consumer of the crate resolves.
+# Its own floor on ikigai-core (0.1.100) is below the library's 0.1.108 since 0.3.0,
+# so it no longer lifts what the test builds against; the test's `EndpointSpace::named`
+# and `space_iri` (0.1.89) are under both.
 ikigai-conformance = "0.8.0"
 # Reads `tests/vectors/auth_vectors.json`, the shared Authorization and base64 vectors
 # Python and Deno pin a byte-identical copy of (ledger #1857). `Value` indexing only.
