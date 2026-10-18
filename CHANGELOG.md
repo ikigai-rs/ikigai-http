@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### Added: WebDAV `PROPFIND` and `REPORT` (ledger #1875)
+
+- **`urn:http:propfind`** (id `http-propfind`) and **`urn:http:report`** (id
+  `http-report`), the methods CalDAV and CardDAV need (calendar listing, RFC 4791
+  `calendar-query`, RFC 6578 `sync-collection`). Both resolve with `sink`, so the
+  XML request is `content=` (and `content_type=`); `Depth` goes through `headers=`.
+- **Never cached, and never a write.** They are uncacheable, like every `sink`, but
+  they are safe methods: a success cuts no golden thread, so a cached `GET` of the
+  same URL stays cached (`Method::is_mutating` is `false` for both).
+- **Never follow a redirect**, exactly like `POST`/`PUT`/`PATCH`/`DELETE`: a 3xx with
+  a `Location` is a typed `Endpoint` error naming the target, and the body is not
+  replayed. Redirect-following stays GET/HEAD only. The refusal message now says
+  "methods that send a body never follow redirects" (it said "mutating methods").
+- **The same `urn:cap:net:<host>` ACL** as every other method, declared as
+  `urn:cap:net:*` and checked per request; the same status mapping (a `207
+  Multi-Status` is a success, its body passed through with the origin's bare media
+  type).
+- `Method::Propfind` and `Method::Report`; `Method::ALL` is now 8 long; new
+  `Method::has_deprecated_iri` (`false` for the two, which never had a pre-0.2.0
+  name, so `deprecated_aliases()` still holds exactly six rules and
+  `Method::deprecated_iri` returns their own IRI).
+- The conformance walk covers all eight endpoints; `OUTPUTS` is waived on the two new
+  pass-through actions for the same reason as the other five.
+
+⚠ **Semver, stated plainly.** `Method` is an exhaustive public enum, and the Cargo
+SemVer reference counts a new variant on one as a major change: a consumer that
+`match`es on `Method` without a wildcard arm stops compiling, and so does code that
+names `Method::ALL`'s type as `[Method; 6]`. Every consumer was checked: the five
+crates.io reverse dependencies (ikigai-browse, ikigai-dev-server, ikigai-embedded,
+ikigai-llm, ikigai-meeting) and the unpublished ones (web-demo, cms-web, tutorial,
+gonk). Each uses `as_str()`, `==`/`!=` or a variant as a value; none matches
+exhaustively, and none names the array type.
+This ships as a 0.2.x release on that evidence, so ikigai-personal can use it
+without a cascade.
 ## 0.2.1
 
 ### Added: one Authorization-header and base64 helper (ledger #1857)

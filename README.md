@@ -13,25 +13,42 @@ It depends only on the published `ikigai-core`.
 Each method is its own resource, resolved with the verb whose cacheability matches
 the method — so "is this cached?" falls straight out of the verb:
 
-| resolve  | IRI               | id            | HTTP   | cacheable |
-|----------|-------------------|---------------|--------|-----------|
-| `source` | `urn:http:get`    | `http-get`    | GET    | yes       |
-| `exists` | `urn:http:head`   | `http-head`   | HEAD   | yes       |
-| `sink`   | `urn:http:post`   | `http-post`   | POST   | no        |
-| `sink`   | `urn:http:put`    | `http-put`    | PUT    | no        |
-| `sink`   | `urn:http:patch`  | `http-patch`  | PATCH  | no        |
-| `delete` | `urn:http:delete` | `http-delete` | DELETE | no        |
+| resolve  | IRI                 | id              | HTTP     | cacheable |
+|----------|---------------------|-----------------|----------|-----------|
+| `source` | `urn:http:get`      | `http-get`      | GET      | yes       |
+| `exists` | `urn:http:head`     | `http-head`     | HEAD     | yes       |
+| `sink`   | `urn:http:post`     | `http-post`     | POST     | no        |
+| `sink`   | `urn:http:put`      | `http-put`      | PUT      | no        |
+| `sink`   | `urn:http:patch`    | `http-patch`    | PATCH    | no        |
+| `delete` | `urn:http:delete`   | `http-delete`   | DELETE   | no        |
+| `sink`   | `urn:http:propfind` | `http-propfind` | PROPFIND | no        |
+| `sink`   | `urn:http:report`   | `http-report`   | REPORT   | no        |
 
 The URL is an argument (`url=`, an `xsd:anyURI`, the only required input), so one
 binding serves every URL and the cache keys on the URL. Optional args set request
 headers: `accept`, `authorization`, `range`, and a generic `headers=` block (one
-`Name: Value` per line); mutating methods also take `content=` (the body) and
-`content_type=`. Every input is typed in the manifold, so `urn:kernel:actions`
+`Name: Value` per line); every method but GET and HEAD also takes `content=` (the
+body) and `content_type=`. Every input is typed in the manifold, so `urn:kernel:actions`
 and the MCP projection state the contract an agent can form a call from.
 
 The result carries the origin's `Content-Type`; the declared output
 (`application/octet-stream`) is what an unlabeled response is served as. `HEAD`
 always serves `text/plain` (`true`/`false`) and declares exactly that.
+
+### WebDAV: PROPFIND and REPORT
+
+`urn:http:propfind` (RFC 4918) and `urn:http:report` (RFC 3253) are what CalDAV and
+CardDAV clients need: listing a calendar home, a `calendar-query` (RFC 4791), an RFC
+6578 `sync-collection`. Both are safe methods that carry an XML body, so they
+resolve with `sink` and are never cached, but they are not writes: a success cuts
+no golden thread, so a cached GET of the same URL stays cached. `Depth` goes
+through `headers=`; a `207 Multi-Status` is the result, with the origin's
+`Content-Type`. They are gated by the same `urn:cap:net` ACL as every other
+method, and never follow a redirect.
+
+```text
+sink urn:http:propfind url=https://dav.example.com/calendars/me/ headers="Depth: 1" content_type=application/xml content=<the propfind XML>
+```
 
 ### Renamed in 0.2.0; the old IRIs are deprecated aliases until 0.3.0
 
@@ -41,7 +58,8 @@ Through 0.1.x these bound at `urn:httpGet` … `urn:httpDelete` with camelCase i
 answers exactly as `urn:http:get` (one cache entry, one golden thread, the new id
 when it describes itself), and the catalog lists only the new names. **0.3.0
 removes them.** The old ids are not kept: an id is a name, not an IRI, and nothing
-resolves by it, so MCP tool names and catalog labels move now. See
+resolves by it, so MCP tool names and catalog labels move now. PROPFIND and REPORT
+arrived after the rename and have no old name. See
 [CHANGELOG.md](CHANGELOG.md) for the full map.
 
 ## Capabilities
@@ -49,6 +67,11 @@ resolves by it, so MCP tool names and catalog labels move now. See
 Calls are gated by `urn:cap:net:<host>[/<path-prefix>]` scopes (a leading `-`
 denies), matched longest-prefix-wins, deny-breaks-ties, segment-aware,
 default-deny. A `root` capability allows everything.
+
+The endpoint, not the transport, follows redirects, and only for GET and HEAD,
+re-running the ACL on every hop. Every method that sends a body (POST, PUT, PATCH,
+DELETE, PROPFIND, REPORT) refuses a 3xx with a typed error naming the target, so
+the body is never replayed at an authority the caller did not vet.
 
 ## Caching (needs `ikigai-core` ≥ 0.1.12)
 
@@ -69,7 +92,7 @@ let space = ikigai_http::space(Arc::new(MyTransport));
 // mount `space` in your kernel, then: source urn:http:get url=https://example.com
 ```
 
-`space` returns core's `Alias` overlay over the six bindings (that is how the
+`space` returns core's `Alias` overlay over the eight bindings (that is how the
 deprecated names resolve); hold it as an `Arc<dyn Space>`. `endpoints` returns the
 bare `EndpointSpace` without the aliases, and `deprecated_aliases` the rewrite table,
 for a host that wants it at `urn:kernel:aliases` too (`Kernel::with_aliases`).
@@ -118,7 +141,10 @@ a typed `Denied` before any socket opens (the origin counts its connections); a
 redirect to a host outside the allowlist dies at the ACL before the hop; an
 `ETag` alone leaves a read live (no conditional revalidation exists); and each
 deprecated name answers exactly as its new one on every verb (the suite walks the
-catalog, which lists only the new names, so it never sees an alias).
+catalog, which lists only the new names, so it never sees an alias). The WebDAV
+pair is pinned against the origin too: the method token, the XML body and the
+`Depth` header reach the wire, a `207` is the result, two calls are two requests,
+a cached GET of the same URL survives, and a redirect is refused.
 
 `space(transport)` carries **no name of its own**, and the suite holds it to that
 (`SPACE-NAME`, declared host-named). It is instance-built: its doors close over
@@ -127,13 +153,13 @@ same doors), so only the host knows which instance it is and the host names it.
 
 Every check runs, `NAMES` included (it was skipped through 0.1.x, while the
 camelCase ids waited for the coordinated rename). One check is waived, and the
-printed report says why: `OUTPUTS` is waived **per endpoint** for the five
+printed report says why: `OUTPUTS` is waived **per endpoint** for the seven
 actions that serve the origin's own `Content-Type` — `outputs` is a closed list
 in core's `Description`, so there is nothing truthful to declare beyond
 `application/octet-stream`, the type served when the origin labels nothing, and
 enumerating types an origin might send would pass the check by lying. The waiver
-is one check on five ids, never the whole endpoint: `ENFORCED` and `CACHEABLE`
-keep running on all six. What it gives up is pinned by hand — the origin's label
+is one check on seven ids, never the whole endpoint: `ENFORCED` and `CACHEABLE`
+keep running on all eight. What it gives up is pinned by hand — the origin's label
 passes through, an unlabeled response gets the declared fallback, and a label
 with parameters is served as its bare media type.
 

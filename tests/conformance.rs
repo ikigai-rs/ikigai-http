@@ -1,8 +1,12 @@
-//! The module recipe as one test: `ikigai-conformance` walks the six endpoints
+//! The module recipe as one test: `ikigai-conformance` walks the eight endpoints
 //! [`ikigai_http::space`] binds and reports every violation at once.
 //!
-//! The six bind at `urn:http:get` … `urn:http:delete` with ids `http-get` …
-//! `http-delete` (0.2.0, ledger #11). The pre-0.2.0 names `urn:httpGet` …
+//! The original six bind at `urn:http:get` … `urn:http:delete` with ids `http-get` …
+//! `http-delete` (0.2.0, ledger #11); the WebDAV pair `urn:http:propfind` and
+//! `urn:http:report` (`http-propfind`, `http-report`) joined them in 0.2.2 (ledger
+//! #1875), both `Sink`, both uncacheable, neither following a redirect, and
+//! [`propfind_and_report_reach_the_origin_as_dav_requests`] pins what the suite
+//! cannot see of them. The pre-0.2.0 names `urn:httpGet` …
 //! `urn:httpDelete` stay bound as deprecated aliases through 0.2.x, and
 //! [`a_deprecated_name_answers_exactly_as_its_new_name`] pins that each one
 //! answers as its new name does, on every verb, against the real origin.
@@ -29,7 +33,7 @@
 //!   freshness is a live fact, served uncacheable, and `Suite::live` (0.1.1) holds
 //!   the kernel to `Expiry::Always` there. That is the polarity nothing else can
 //!   see: were a dependency or a stray `.cacheable()` to make this read cached, no
-//!   type would change and no other check would speak. The four mutating verbs are
+//!   type would change and no other check would speak. The six `Sink`/`Delete` actions are
 //!   not declared live — `Check::Cacheable` returns before looking at a verb that
 //!   is not cacheable, so the declaration would be silently inert.
 //! - [`conforms_and_caches_under_a_freshness_window`] walks `/fresh`
@@ -38,40 +42,41 @@
 //!   a non-empty thread set (the URL's golden thread, which a mutating call to the
 //!   same URL cuts). The declaration is true over THIS origin's answer, not the
 //!   module in isolation (PENDING #18/#30): the same code over `/live` is live.
-//! - `NAMES` runs, and is clean: the six ids are kebab-case nouns since 0.2.0.
-//!   It was skipped suite-wide through 0.1.x, while the camelCase ids waited for
-//!   the coordinated rename (ledger #11); [`the_six_ids_are_kebab_case_names`]
-//!   holds the check to running on all six.
-//! - `OUTPUTS` is **waived per endpoint** for the five pass-through actions
+//! - `NAMES` runs, and is clean: the eight ids are kebab-case nouns (the original
+//!   six since 0.2.0). It was skipped suite-wide through 0.1.x, while the camelCase
+//!   ids waited for the coordinated rename (ledger #11); [`the_ids_are_kebab_case_names`]
+//!   holds the check to running on all eight.
+//! - `OUTPUTS` is **waived per endpoint** for the seven pass-through actions
 //!   ([`PASS_THROUGH`]), with [`Suite::opt_out_check`] and the reason printed in
 //!   the report. It cannot be satisfied: `http-get`/`http-post`/`http-put`/
-//!   `http-patch`/`http-delete` serve whatever `Content-Type` the origin sends, and
+//!   `http-patch`/`http-delete`/`http-propfind`/`http-report` serve whatever
+//!   `Content-Type` the origin sends, and
 //!   `outputs` is a closed list in core's `Description` — there is no pass-through
 //!   spelling (core PENDING §20 is the condition for removing this waiver). The
 //!   declared `application/octet-stream` is true, and is the ONLY thing that can be
 //!   declared: it is what the action serves when the origin labels nothing. Naming
 //!   the types an origin might send would be a lie that happens to pass.
 //!   ⚠ The waiver is per CHECK, not per endpoint: `Suite::opt_out` would drop
-//!   `ENFORCED` and `CACHEABLE` on the same five, which is this module's most
+//!   `ENFORCED` and `CACHEABLE` on the same seven, which is this module's most
 //!   valuable coverage. What the waiver gives up is pinned by hand in
 //!   [`declared_outputs_are_the_media_types_served`].
 //! - **`SPACE-NAME`: [`ikigai_http::space`] is host-named** ([`SPACE_LABEL`]).
-//!   It is instance-built: its six doors close over the [`HttpTransport`] the host
+//!   It is instance-built: its eight doors close over the [`HttpTransport`] the host
 //!   hands it, so two calls with two transports are two different spaces, and a
 //!   name of its own would claim they are one (a name is a cache claim: same name,
 //!   same doors). So the space stays anonymous and the host names it. The suite is
 //!   handed the SAME `Arc` the kernel walks ([`http_space`]), and holds it to
 //!   `id() == None` and an anonymous topology root.
 //!   [`a_self_named_http_space_goes_red`] shows the declaration is load-bearing.
-//! - **`REQUIRED` covers the four mutating verbs too** (`Suite::required_on_mutating`,
-//!   0.8.0). `url` is the one required input on all six actions, and dropping it
+//! - **`REQUIRED` covers the six `Sink`/`Delete` actions too** (`Suite::required_on_mutating`,
+//!   0.8.0). `url` is the one required input on all eight actions, and dropping it
 //!   must be refused with a typed `MissingArgument` before any socket opens: the
 //!   "declared required, actually optional" direction that
 //!   [`the_manifold_states_the_contract`] could only pin as a declaration before
 //!   0.8.0. Turning it on for `Sink`/`Delete` is safe here and nowhere near a
 //!   live service: each drop is refused at `inv.inline_str("url")` before the
 //!   transport is called, and [`assert_fired_once_each`] proves it, since the
-//!   origin still sees exactly six requests (the pipeline probe's firing is the
+//!   origin still sees exactly eight requests (the pipeline probe's firing is the
 //!   baseline each drop is measured against, so no extra baseline firing is made).
 //!   A clean `DECLARATIONS` is the evidence the declaration reached the check.
 //!
@@ -102,7 +107,7 @@
 //! - **What the `OUTPUTS` waiver gives up**
 //!   ([`declared_outputs_are_the_media_types_served`]): `http-head` serves
 //!   `text/plain` (`true`/`false`), declares it, and is NOT waived — the check runs
-//!   on it. For the five that are waived, the hand test pins all three cases the
+//!   on it. For the seven that are waived, the hand test pins all three cases the
 //!   check would have seen: the origin's label passes through (`/live` →
 //!   `text/plain`), an origin that labels nothing gets the declared fallback
 //!   (`/untyped` → `application/octet-stream`), and a label with parameters is
@@ -111,11 +116,12 @@
 //!   comparing).
 //! - **The mutating verbs' `content` reaches the wire** ([`the_mutating_verbs_send_content_as_the_body`]):
 //!   PIPELINE can only say `content` did not raise `MissingArgument`; the origin
-//!   can say the bytes arrived, for all four — `DELETE` included.
+//!   can say the bytes arrived, for all six `Sink`/`Delete` actions — `DELETE`,
+//!   `PROPFIND` and `REPORT` included.
 //! - **The manifold states the contract** ([`the_manifold_states_the_contract`]):
 //!   only `url` is required, every input has a class, every action declares
 //!   `urn:cap:net:*`. That `url` really IS required (refused when absent) is
-//!   `REQUIRED`'s, on all six verbs; this pins that nothing ELSE is declared
+//!   `REQUIRED`'s, on all eight actions; this pins that nothing ELSE is declared
 //!   required, the direction `REQUIRED` cannot see.
 //! - **A deprecated name answers exactly as its new name**
 //!   ([`a_deprecated_name_answers_exactly_as_its_new_name`]): the suite walks the
@@ -138,14 +144,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use url::Url;
 
-/// The six endpoints `space()` binds: description id, bound IRI, verb.
-const METHODS: [(&str, &str, Verb); 6] = [
+/// The eight endpoints `space()` binds: description id, bound IRI, verb.
+const METHODS: [(&str, &str, Verb); 8] = [
     ("http-get", "urn:http:get", Verb::Source),
     ("http-head", "urn:http:head", Verb::Exists),
     ("http-post", "urn:http:post", Verb::Sink),
     ("http-put", "urn:http:put", Verb::Sink),
     ("http-patch", "urn:http:patch", Verb::Sink),
     ("http-delete", "urn:http:delete", Verb::Delete),
+    ("http-propfind", "urn:http:propfind", Verb::Sink),
+    ("http-report", "urn:http:report", Verb::Sink),
 ];
 
 /// The pre-0.2.0 names, each kept as a deprecated alias of the new one through
@@ -160,15 +168,17 @@ const DEPRECATED: [(&str, &str); 6] = [
     ("urn:httpDelete", "urn:http:delete"),
 ];
 
-/// The five actions that serve the ORIGIN's `Content-Type` — everything but
+/// The seven actions that serve the ORIGIN's `Content-Type` — everything but
 /// `http-head`, whose `true`/`false` is always `text/plain`. `OUTPUTS` is waived
 /// for exactly these, and for no other check.
-const PASS_THROUGH: [&str; 5] = [
+const PASS_THROUGH: [&str; 7] = [
     "http-get",
     "http-post",
     "http-put",
     "http-patch",
     "http-delete",
+    "http-propfind",
+    "http-report",
 ];
 
 /// Why `OUTPUTS` cannot be satisfied here, printed in every report the suite
@@ -198,6 +208,7 @@ const NET_WILDCARD: &str = "urn:cap:net:*";
 struct Received {
     method: String,
     path: String,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -278,7 +289,12 @@ impl Origin {
                         break;
                     }
                     connections.fetch_add(1, Ordering::SeqCst);
-                    let Some(Message { start, body, .. }) = read_message(&mut stream) else {
+                    let Some(Message {
+                        start,
+                        headers: request_headers,
+                        body,
+                    }) = read_message(&mut stream)
+                    else {
                         continue;
                     };
                     let mut parts = start.split_whitespace();
@@ -290,10 +306,12 @@ impl Origin {
                     } else {
                         body_out
                     };
-                    received
-                        .lock()
-                        .unwrap()
-                        .push(Received { method, path, body });
+                    received.lock().unwrap().push(Received {
+                        method,
+                        path,
+                        headers: request_headers,
+                        body,
+                    });
                     let mut head = format!(
                         "HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: {}\r\n",
                         body_out.len()
@@ -398,6 +416,13 @@ fn respond(path: &str, port: u16) -> (u16, &'static str, Vec<(&'static str, Stri
             vec![("Location", format!("http://localhost:{port}/live"))],
             Vec::new(),
         ),
+        // A WebDAV collection: a 207 Multi-Status in XML.
+        "/dav/" => (
+            207,
+            "Multi-Status",
+            vec![("Content-Type", "application/xml; charset=utf-8".to_string())],
+            br#"<d:multistatus xmlns:d="DAV:"/>"#.to_vec(),
+        ),
         // A redirect within the grant.
         "/hop-in" => (
             302,
@@ -490,7 +515,7 @@ fn clocked_kernel() -> Kernel {
 }
 
 /// The suite for this module: every action's `url=` on one path of the origin,
-/// every check on, OUTPUTS waived for the five pass-through actions and running
+/// every check on, OUTPUTS waived for the seven pass-through actions and running
 /// everywhere else, REQUIRED held on the mutating verbs too, and `space` (the
 /// instance the kernel walks) declared host-named.
 fn suite(origin: &Origin, path: &str, space: &Arc<Alias>) -> Suite {
@@ -507,10 +532,10 @@ fn suite(origin: &Origin, path: &str, space: &Arc<Alias>) -> Suite {
     suite
 }
 
-/// The walk saw six endpoints, one action each (the deprecated aliases are not
-/// enumerated, so they are not a seventh to twelfth), skipped no check, waived
-/// exactly OUTPUTS on exactly the five pass-through ids, and opted no endpoint out
-/// wholesale. A seventh endpoint bound without a line here, or a check quietly
+/// The walk saw eight endpoints, one action each (the deprecated aliases are not
+/// enumerated, so they are not a ninth to fourteenth), skipped no check, waived
+/// exactly OUTPUTS on exactly the seven pass-through ids, and opted no endpoint out
+/// wholesale. A ninth endpoint bound without a line here, or a check quietly
 /// waived, is held to a weaker standard.
 fn assert_shape(report: &Report) {
     assert_eq!(report.endpoints, METHODS.len(), "{report}");
@@ -537,7 +562,7 @@ fn assert_shape(report: &Report) {
         .collect();
     assert_eq!(
         waived, expected,
-        "OUTPUTS is waived for the five pass-through actions and nothing else — \
+        "OUTPUTS is waived for the seven pass-through actions and nothing else — \
          `http-head` declares what it serves and is checked: {report}"
     );
     let spaces: Vec<(&str, SpaceNaming)> = report
@@ -571,7 +596,7 @@ fn assert_fired_once_each(origin: &Origin) {
     let methods: Vec<String> = origin.received().into_iter().map(|r| r.method).collect();
     assert_eq!(
         methods,
-        ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
+        ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "PROPFIND", "REPORT"],
         "each action reaches the origin once"
     );
 }
@@ -672,11 +697,11 @@ fn a_self_named_http_space_goes_red() {
     );
 }
 
-/// NAMES runs on all six and finds nothing: every id is a kebab-case noun. Through
+/// NAMES runs on all eight and finds nothing: every id is a kebab-case noun. Through
 /// 0.1.x this test pinned the six camelCase findings the rename would flip
 /// (ledger #11); it now pins that they flipped and that the check is not skipped.
 #[test]
-fn the_six_ids_are_kebab_case_names() {
+fn the_ids_are_kebab_case_names() {
     let report = Suite::new().checks(Checks::NAMES).run_blocking(&kernel());
     assert_eq!(report.endpoints, METHODS.len(), "{report}");
     assert!(
@@ -894,7 +919,7 @@ fn declared_outputs(kernel: &Kernel, iri: &str) -> Vec<String> {
 
 /// What the `OUTPUTS` waiver gives up, pinned by hand. `http-head` is NOT waived:
 /// it always serves `text/plain`, declares exactly that, and the check covers it —
-/// this test only re-states it so the pair reads together. For the five that are
+/// this test only re-states it so the pair reads together. For the seven that are
 /// waived, every case the check would have observed is asserted here: the declared
 /// `application/octet-stream` IS what an unlabeled response is served as, the
 /// origin's own label passes through unchanged, and a label carrying parameters is
@@ -922,7 +947,10 @@ fn declared_outputs_are_the_media_types_served() {
         if verb == Verb::Exists {
             continue;
         }
-        assert!(PASS_THROUGH.contains(&id), "{id} is one of the waived five");
+        assert!(
+            PASS_THROUGH.contains(&id),
+            "{id} is one of the waived seven"
+        );
         assert_eq!(
             declared_outputs(&kernel, iri),
             ["application/octet-stream"],
@@ -998,6 +1026,116 @@ fn the_mutating_verbs_send_content_as_the_body() {
     }
 }
 
+/// What the suite cannot see of the WebDAV pair, against the real origin: the
+/// method token on the wire, the XML body, `Content-Type` and the `Depth` header
+/// from `headers=`; a `207 Multi-Status` served as the result, its bare media type
+/// passed through; never cached (two calls, two requests, on a clocked kernel); a
+/// cached GET of the same URL left cached (a safe method cuts no thread); and a
+/// redirect, even within the grant, refused with the body not replayed.
+#[test]
+fn propfind_and_report_reach_the_origin_as_dav_requests() {
+    let origin = Origin::start();
+    let kernel = clocked_kernel();
+    let cap = scoped(&[ORIGIN_SCOPE]);
+    let body = r#"<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:allprop/></d:propfind>"#;
+    let fresh = origin.url("/fresh");
+    issue(
+        &kernel,
+        Verb::Source,
+        "urn:http:get",
+        &[("url", &fresh)],
+        &cap,
+    )
+    .unwrap();
+    for (token, iri) in [
+        ("PROPFIND", "urn:http:propfind"),
+        ("REPORT", "urn:http:report"),
+    ] {
+        let dav_url = origin.url("/dav/");
+        let args = [
+            ("url", dav_url.as_str()),
+            ("content", body),
+            ("content_type", "application/xml"),
+            ("headers", "Depth: 1"),
+        ];
+        for _ in 0..2 {
+            let out = issue(&kernel, Verb::Sink, iri, &args, &cap)
+                .unwrap_or_else(|e| panic!("{iri}: {e}"));
+            assert_eq!(out.bytes, br#"<d:multistatus xmlns:d="DAV:"/>"#, "{iri}");
+            assert_eq!(out.repr_type.media_type, "application/xml", "{iri}");
+        }
+        let sent: Vec<Received> = origin
+            .received()
+            .into_iter()
+            .filter(|r| r.method == token)
+            .collect();
+        assert_eq!(
+            sent.len(),
+            2,
+            "{iri}: never cached, both calls reached the origin"
+        );
+        for r in &sent {
+            assert_eq!(r.path, "/dav/", "{iri}");
+            assert_eq!(
+                r.body,
+                body.as_bytes(),
+                "{iri}: the XML body reached the wire"
+            );
+            let header = |name: &str| {
+                r.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(header("depth"), Some("1"), "{iri}: {:?}", r.headers);
+            assert_eq!(
+                header("content-type"),
+                Some("application/xml"),
+                "{iri}: {:?}",
+                r.headers
+            );
+        }
+
+        // A safe method cuts no thread: the GET cached above is still cached.
+        let mut dav_on_fresh = args;
+        dav_on_fresh[0] = ("url", fresh.as_str());
+        issue(&kernel, Verb::Sink, iri, &dav_on_fresh, &cap).unwrap();
+        issue(
+            &kernel,
+            Verb::Source,
+            "urn:http:get",
+            &[("url", &fresh)],
+            &cap,
+        )
+        .unwrap();
+        assert_eq!(
+            origin
+                .received()
+                .iter()
+                .filter(|r| r.method == "GET" && r.path == "/fresh")
+                .count(),
+            1,
+            "{iri}: the cached GET survived a {token} to the same URL"
+        );
+
+        // Never follows a redirect, even one within the grant.
+        let before = origin.connections();
+        let hop_url = origin.url("/hop-in");
+        let hop = [("url", hop_url.as_str()), ("content", body)];
+        let err = issue(&kernel, Verb::Sink, iri, &hop, &cap).unwrap_err();
+        assert!(
+            matches!(err, Error::Endpoint(_)) && err.to_string().contains("never follow redirects"),
+            "{iri}: {err:?}"
+        );
+        assert_eq!(
+            origin.connections(),
+            before + 1,
+            "{iri}: the body was not replayed"
+        );
+    }
+    assert_eq!(origin.hits("/live"), 0, "no redirect was followed");
+}
+
 /// The contract as the manifold states it: every action declares the net
 /// wildcard and nothing else, every input has a class, only `url` is required,
 /// the cacheable verbs take `max_age`, the mutating ones take `content` and
@@ -1063,7 +1201,7 @@ fn a_deprecated_name_answers_exactly_as_its_new_name() {
             .iter()
             .copied()
             .find(|(_, iri, _)| *iri == new)
-            .unwrap_or_else(|| panic!("{new} is one of the six"));
+            .unwrap_or_else(|| panic!("{new} is one of the original six"));
         let mut args = vec![("url", url.as_str())];
         if verb.is_mutating() {
             args.push(("content", "a body"));
