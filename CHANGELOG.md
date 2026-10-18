@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
 ### Added: one Authorization-header and base64 helper (ledger #1857)
 
