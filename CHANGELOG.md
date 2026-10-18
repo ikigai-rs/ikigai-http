@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
 ### Added: WebDAV `PROPFIND` and `REPORT` (ledger #1875)
 
