@@ -48,20 +48,18 @@ httpdate = "1.0.3"
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`).
 #
-# 0.8.0 is the true minimum of the API the TEST uses: `Suite::required_on_mutating`
-# and the REQUIRED check it reaches (0.8.0: `url` is the one required input, and
-# dropping it must be refused typed on all six verbs), `Suite::host_named_space`
-# (SPACE-NAME, 0.6.0: `space(transport)` is instance-built, so the host names it),
-# `Suite::opt_out_check` (the per-check waiver the five pass-through actions need;
-# `opt_out` would drop ENFORCED and CACHEABLE with it) and `Suite::live` (the
-# declaration that makes "a web read with no freshness signal is live" a checked
-# promise). Read the caret as a RANGE: `^0.8.0` is `<0.9.0`, a ceiling as well as a
-# floor (field guide rule 5), so a 0.9 needs a deliberate bump here.
+# 0.10.0 adds, over the 0.8.0 this test was written against: 0.9.0's core 0.1.105
+# contract-shape checks (REQUIRED probes input groups, OUTPUTS honors `output_from`,
+# PIPELINE's named-only line, VALIDATE refuses a default on a binding) and RECOMPUTE;
+# 0.10.0's FAILURES, which is OFF unless a suite opts in with `Suite::check_failures()`
+# (not done here yet, so the report carries one `skipped: FAILURES` line). The API the
+# test uses (`Suite::required_on_mutating`, `host_named_space`, `opt_out_check`, `live`)
+# is 0.8.0's. Read the caret as a RANGE: `^0.10.0` is `<0.11.0`, a ceiling as well as a
+# floor (field guide rule 5), so a 0.11 needs a deliberate bump here.
 #
-# Its own floor on ikigai-core (0.1.100) is below the library's 0.1.108 since 0.3.0,
-# so it no longer lifts what the test builds against; the test's `EndpointSpace::named`
-# and `space_iri` (0.1.89) are under both.
-ikigai-conformance = "0.8.0"
+# Its own floor on ikigai-core is 0.1.108, equal to the library's pin, so the tests
+# resolve the same core the crate builds against.
+ikigai-conformance = "0.10.0"
 # Reads `tests/vectors/auth_vectors.json`, the shared Authorization and base64 vectors
 # Python and Deno pin a byte-identical copy of (ledger #1857). `Value` indexing only.
 serde_json = "1"
