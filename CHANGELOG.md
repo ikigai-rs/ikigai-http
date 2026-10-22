@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added: a host glob in the net ACL, `urn:cap:net:*.<suffix>` (ledger #35)
+
+`urn:cap:net:*.edu` grants every host strictly under `.edu` (`mit.edu`, `a.b.mit.edu`;
+never `edu`, `xedu` or `mit.edu.evil.com`), as an allow or a deny, with the usual
+optional `:port` and `/path-prefix`. Only a whole leftmost `*` label is a glob; any
+other `*` in a host is malformed: a malformed allow grants nothing, and a malformed
+deny refuses every request under that capability, so a malformed rule never widens.
+A glob never matches an IP literal. Specificity: an exact host outranks every glob,
+a longer glob suffix outranks a shorter one, then the longer port/path, and a deny
+still breaks ties. The module docs ("The capability ACL", "Host globs") state it all.
+
+### ⚠ Changed: hosts are compared normalized, exact rules included
+
+The request host and every rule host are normalized by the `url` crate's WHATWG host
+parser before comparison: ASCII case, one trailing dot dropped, an IDN in its A-label
+(punycode) form, an IP literal canonical. So `urn:cap:net:mit.edu` now also grants
+`mit.edu.`, and `urn:cap:net:bücher.de` grants `xn--bcher-kva.de`. This WIDENS exact
+allows to the other spellings of the same host. It is what keeps an exact DENY whole
+beside a glob: `*.edu` matches `mit.edu.`, so without it `-mit.edu` would be bypassed
+by a trailing dot. A host that does not parse is compared as before (ASCII
+case-insensitive), and matches no glob.
+
 ## 0.3.0
 
 ### ⚠ Changed: an origin's 401/403 is now `Error::Refused`, not `Error::Denied`
