@@ -94,7 +94,9 @@
 //! (an IPv6 host in a rule uses brackets: `urn:cap:net:[::1]:8080`). A bare
 //! `urn:cap:net:` scope (no host) grants **nothing**: there is no match-everything
 //! rule, and the widest grant short of `root` is a glob over one suffix. A `root`
-//! capability allows everything.
+//! capability allows everything. A rule with an empty host or an invalid port
+//! (empty, nonnumeric, or outside `0..=65535`) is malformed: an allow grants
+//! nothing, and a deny refuses the whole check, even for another host or path.
 //! (Per the locked design the scope is host/path only — not per-method; an agent
 //! is trusted with a host, not with a verb. A finer `urn:cap:net:<method>:…` form
 //! is a possible later refinement.)
@@ -423,6 +425,8 @@ pub fn net_allows(capability: &ikigai_core::Capability, host: &str, path: &str) 
 /// whole labels only, and never an IP literal. A rule with a `*` anywhere else in its
 /// host is MALFORMED: as an allow it grants nothing, and as a deny it makes this
 /// check refuse every request, since ignoring a deny would widen the grant.
+/// The same applies to rules with an empty host or an invalid port (empty,
+/// nonnumeric, or outside `0..=65535`).
 pub fn net_allows_port(
     capability: &ikigai_core::Capability,
     host: &str,
@@ -453,16 +457,9 @@ pub fn net_allows_port(
             Some(r) => (false, r),
             None => (true, rest),
         };
-        // A bare `urn:cap:net:` (or `urn:cap:net:-`) contributes no rule: there is
-        // no wildcard-allow — an empty rule must not match every authority.
-        if rule.is_empty() {
-            continue;
-        }
         let parsed = match parse_rule(rule) {
-            Ok(Some(parsed)) => parsed,
-            // A rule that can match nothing (a port out of range) contributes nothing.
-            Ok(None) => continue,
-            // A malformed glob. As an allow it grants nothing. As a deny it refuses the
+            Ok(parsed) => parsed,
+            // A malformed rule. As an allow it grants nothing. As a deny it refuses the
             // whole check: the holder meant to exclude SOMETHING and we cannot tell
             // what, so skipping it would silently widen the grant.
             Err(Malformed) => {
@@ -509,7 +506,7 @@ enum HostRank {
     Exact,
 }
 
-/// A rule with a `*` in its host that is not the one accepted glob form.
+/// A rule with a malformed host glob, an empty host, or an invalid port.
 #[derive(Debug, PartialEq, Eq)]
 struct Malformed;
 
@@ -562,25 +559,26 @@ struct Rule<'a> {
     rest: usize,
 }
 
-/// Parse one rule. `Ok(None)` is a rule that matches nothing (digits for a port, but
-/// out of range); `Err(Malformed)` is a `*` in the host anywhere but as a whole
-/// leftmost label followed by a registered-name suffix. A bracketed IPv6 host
-/// (`[::1]:8080`) parses as host `[::1]`, port `8080`: the trailing-digits check keeps
-/// the address's own colons from being misread as a port.
-fn parse_rule(rule: &str) -> std::result::Result<Option<Rule<'_>>, Malformed> {
+/// Parse one rule, rejecting malformed globs, empty hosts, and invalid ports.
+/// A bracketed IPv6 host (`[::1]:8080`) parses as host `[::1]`, port `8080`;
+/// a bracketed authority ending in `]` has no port.
+fn parse_rule(rule: &str) -> std::result::Result<Rule<'_>, Malformed> {
     let (rule_authority, rule_path) = match rule.split_once('/') {
         Some((authority, path)) => (authority, path),
         None => (rule, ""),
     };
     let (rule_host, rule_port) = match rule_authority.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
-            match p.parse::<u16>() {
-                Ok(n) => (h, Some(n)),
-                Err(_) => return Ok(None), // digits but out of range: matches nothing
+        Some((h, p)) if !(rule_authority.starts_with('[') && rule_authority.ends_with(']')) => {
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Malformed);
             }
+            (h, Some(p.parse::<u16>().map_err(|_| Malformed)?))
         }
         _ => (rule_authority, None),
     };
+    if rule_host.is_empty() {
+        return Err(Malformed);
+    }
     let host = if rule_host.contains('*') {
         // Exactly one form: `*.` followed by a suffix with no `*`, which normalizes to
         // a registered name. That refuses `*`, `*.`, `**.com`, `*foo.com`, `foo*.com`,
@@ -596,12 +594,12 @@ fn parse_rule(rule: &str) -> std::result::Result<Option<Rule<'_>>, Malformed> {
     } else {
         RuleHost::Exact(rule_host, normalize_host(rule_host))
     };
-    Ok(Some(Rule {
+    Ok(Rule {
         host,
         port: rule_port,
         path: rule_path,
         rest: rule.len() - rule_host.len(),
-    }))
+    })
 }
 
 impl Rule<'_> {

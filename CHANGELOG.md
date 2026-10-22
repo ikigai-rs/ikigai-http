@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed: malformed net denies fail closed (ledger #2091)
+
+A deny with an out-of-range, nonnumeric, or empty port, or an empty host,
+now refuses the whole capability check, just like a malformed host glob.
+Previously these exclusions silently matched nothing, leaving other grants active.
+Malformed allows still grant nothing; valid ports and bracketed IPv6 rules are unchanged.
+
 ### Added: a host glob in the net ACL, `urn:cap:net:*.<suffix>` (ledger #35)
 
 `urn:cap:net:*.edu` grants every host strictly under `.edu` (`mit.edu`, `a.b.mit.edu`;
