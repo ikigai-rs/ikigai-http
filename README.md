@@ -102,9 +102,13 @@ assert_eq!(err.to_string(), "retry later: rate-limited: HTTP 429");
 
 ## Capabilities
 
-Calls are gated by `urn:cap:net:<host>[/<path-prefix>]` scopes (a leading `-`
-denies), matched longest-prefix-wins, deny-breaks-ties, segment-aware,
-default-deny. A `root` capability allows everything.
+Calls are gated by `urn:cap:net:<host>[:<port>][/<path-prefix>]` scopes (a leading
+`-` denies), matched most-specific-wins, deny-breaks-ties, segment-aware,
+default-deny. A `root` capability allows everything. The host may be a leftmost-label
+glob, `urn:cap:net:*.edu`, which grants every host strictly under `.edu` in one token;
+an exact host outranks a glob, a longer suffix outranks a shorter one, and hosts are
+compared normalized (case, trailing dot, IDN as punycode). A glob over a public suffix
+(`*.com`) is very broad. The crate docs state the full grammar.
 
 The endpoint, not the transport, follows redirects, and only for GET and HEAD,
 re-running the ACL on every hop. Every method that sends a body (POST, PUT, PATCH,

@@ -85,16 +85,82 @@
 //! - `urn:cap:net:example.com/api` — only paths under `/api`.
 //! - `urn:cap:net:example.com` **+** `urn:cap:net:-example.com/admin` — the host
 //!   except `/admin`.
+//! - `urn:cap:net:*.edu` — every host under `.edu` (`mit.edu`, `a.b.mit.edu`), in
+//!   ONE token (ledger #35; see "Host globs" below).
 //!
-//! Matching is **longest-prefix wins**, **deny breaks ties**, segment-aware (so
+//! Matching is **most specific wins**, **deny breaks ties**, segment-aware (so
 //! `/api` does not match `/apixyz`); no matching rule → **default-deny**. A rule
 //! without a port matches any port; a rule with a port matches exactly that port
 //! (an IPv6 host in a rule uses brackets: `urn:cap:net:[::1]:8080`). A bare
-//! `urn:cap:net:` scope (no host) grants **nothing** — there is no wildcard-allow
-//! rule; breadth is granted host by host. A `root` capability allows everything.
+//! `urn:cap:net:` scope (no host) grants **nothing**: there is no match-everything
+//! rule, and the widest grant short of `root` is a glob over one suffix. A `root`
+//! capability allows everything.
 //! (Per the locked design the scope is host/path only — not per-method; an agent
 //! is trusted with a host, not with a verb. A finer `urn:cap:net:<method>:…` form
 //! is a possible later refinement.)
+//!
+//! Hosts are compared **normalized**, the request's and the rule's alike: ASCII case
+//! ignored, one trailing dot dropped (`mit.edu.` is `mit.edu`), an internationalized
+//! name in its A-label (punycode) form (`bücher.de` is `xn--bcher-kva.de`), and an IP
+//! literal in canonical form. The normalization is the URL parser's own (the `url`
+//! crate's WHATWG host parser and IDNA), so a rule means the host a URL resolves to.
+//!
+//! ### Host globs
+//!
+//! `urn:cap:net:*.<suffix>[:<port>][/<path-prefix>]`, as an allow or a deny
+//! (`urn:cap:net:-*.example.com`). The `*` is the **whole leftmost label** and stands
+//! for one or more labels:
+//!
+//! - `*.edu` matches `mit.edu` and `a.b.mit.edu`, and NOT `edu` itself, `xedu`,
+//!   `notedu`, or `mit.edu.evil.com`. Labels match whole, so `*.example.com` does not
+//!   match `badexample.com`.
+//! - A glob never matches an IP literal: `*.1` is not a glob at all (its suffix is a
+//!   number), and no glob matches `10.0.0.1` or `[::1]`.
+//! - Only that one form is a glob. A `*` anywhere else in the host is **malformed**:
+//!   `*`, `*.`, `**.com`, `*foo.com`, `foo*.com`, `a.*.com`, `*.*.com`. A malformed
+//!   allow grants nothing; a malformed **deny refuses every request** under that
+//!   capability, because skipping it would silently widen what the holder meant to
+//!   grant. Either way a malformed rule never widens.
+//!
+//! **Specificity**, from most to least: an exact host outranks every glob for the same
+//! host; between globs a longer suffix outranks a shorter one; between rules with the
+//! same host part, the longer `:port`/`/path` wins, as it always has. A deny still
+//! breaks a tie. So `*.edu` + `-*.cs.mit.edu` grants `mit.edu` but not `ai.cs.mit.edu`;
+//! `-*.edu` + `mit.edu` grants only `mit.edu`; `*.edu/api` + `-*.edu/api/admin` grants
+//! `/api` under `.edu` except `/api/admin`. The host decides FIRST: `mit.edu` +
+//! `-*.edu/admin` grants `mit.edu/admin`, since an exact host outranks the glob
+//! whatever its path; to keep `/admin` out there, say so on the exact host
+//! (`-mit.edu/admin`).
+//!
+//! ⚠ **A glob over a public suffix is very broad.** `*.com` or `*.co.uk` is every
+//! registrable name under it, and nothing here consults a public-suffix list. A TLD
+//! glob is allowed on purpose (the `.edu` ceiling is the point of the form), so treat
+//! one as close to `root` for that suffix.
+//!
+//! ```
+//! use ikigai_core::Capability;
+//! use ikigai_http::{net_allows, net_allows_port};
+//!
+//! let cap = Capability::root().attenuate([
+//!     "urn:cap:net:*.edu".to_string(),
+//!     "urn:cap:net:-*.cs.mit.edu".to_string(),
+//! ]);
+//! assert!(net_allows(&cap, "mit.edu", "/"));
+//! assert!(net_allows(&cap, "a.b.mit.edu", "/x"));
+//! assert!(net_allows(&cap, "MIT.EDU.", "/")); // normalized
+//! assert!(!net_allows(&cap, "ai.cs.mit.edu", "/")); // the longer suffix denies
+//! assert!(!net_allows(&cap, "edu", "/")); // not the suffix itself
+//! assert!(!net_allows(&cap, "mit.edu.evil.com", "/"));
+//!
+//! // A port on a glob, and a malformed rule granting nothing.
+//! let port = Capability::root().attenuate([
+//!     "urn:cap:net:*.edu:443".to_string(),
+//!     "urn:cap:net:foo*.com".to_string(),
+//! ]);
+//! assert!(net_allows_port(&port, "mit.edu", Some(443), "/"));
+//! assert!(!net_allows_port(&port, "mit.edu", Some(80), "/"));
+//! assert!(!net_allows(&port, "foox.com", "/"));
+//! ```
 //!
 //! ## Redirects
 //!
@@ -103,7 +169,8 @@
 //! would let a granted host 302 the request to an ungranted one — the classic
 //! SSRF-via-redirect). For cacheable methods (`GET`/`HEAD`) the endpoint follows
 //! up to 5 hops, re-running the capability ACL against **each** hop's host, port
-//! and path — a redirect to an ungranted authority is a typed `Denied`. Every
+//! and path — a redirect to an ungranted authority is a typed `Denied`, a host
+//! outside a granted glob included. Every
 //! other method sends a body and never follows a redirect (no cross-host replay of
 //! a request body): a 3xx with a `Location` on `POST`/`PUT`/`PATCH`/`DELETE`/
 //! `PROPFIND`/`REPORT` is a typed error naming the target instead.
@@ -332,9 +399,12 @@ impl Method {
 
 /// The capability path-ACL for outbound HTTP: does `capability` grant a request to
 /// `host` + `path`, on any port? Mirrors the file module's matcher but over a URL's
-/// authority and path. Scopes are `urn:cap:net:<host>[:<port>][/<path-prefix>]`; a
-/// leading `-` denies. Longest matching rule wins, a deny breaks ties, no rule
-/// means deny, and a `root` capability allows everything.
+/// authority and path. Scopes are `urn:cap:net:<host>[:<port>][/<path-prefix>]`,
+/// where `<host>` may also be a leftmost-label glob (`*.edu`); a leading `-` denies.
+/// The most specific matching rule wins (an exact host over any glob, a longer glob
+/// suffix over a shorter one, then the longer port/path), a deny breaks ties, no
+/// rule means deny, and a `root` capability allows everything. The module docs,
+/// "The capability ACL", state the whole grammar.
 ///
 /// This port-less form treats the target port as *unknown*, so port-scoped rules
 /// still match (a caller that can't know the port isn't judged on it). The HTTP
@@ -348,6 +418,11 @@ pub fn net_allows(capability: &ikigai_core::Capability, host: &str, path: &str) 
 /// supplied (`None` = unknown, matches any rule port). A rule that names a port
 /// (`urn:cap:net:example.com:8443`) matches only that port; a rule without one
 /// matches every port on its host. A bare `urn:cap:net:` scope grants nothing.
+///
+/// A host glob (`urn:cap:net:*.edu`) matches every host strictly under its suffix,
+/// whole labels only, and never an IP literal. A rule with a `*` anywhere else in its
+/// host is MALFORMED: as an allow it grants nothing, and as a deny it makes this
+/// check refuse every request, since ignoring a deny would widen the grant.
 pub fn net_allows_port(
     capability: &ikigai_core::Capability,
     host: &str,
@@ -361,8 +436,13 @@ pub fn net_allows_port(
         return false;
     };
     let prefix = "urn:cap:net:";
+    // The request host, normalized once: ASCII lowercase, one trailing dot dropped,
+    // an IDN in its A-label (punycode) form, an IP literal canonical. `None` when the
+    // host does not parse; such a host matches exact rules by plain comparison and no
+    // glob.
+    let target = normalize_host(host);
 
-    let mut best_len: Option<usize> = None;
+    let mut best: Option<Specificity> = None;
     let mut allowed = false;
     for scope in scopes {
         let Some(rest) = scope.strip_prefix(prefix) else {
@@ -378,33 +458,116 @@ pub fn net_allows_port(
         if rule.is_empty() {
             continue;
         }
-        if !rule_matches(rule, host, port, path) {
+        let parsed = match parse_rule(rule) {
+            Ok(Some(parsed)) => parsed,
+            // A rule that can match nothing (a port out of range) contributes nothing.
+            Ok(None) => continue,
+            // A malformed glob. As an allow it grants nothing. As a deny it refuses the
+            // whole check: the holder meant to exclude SOMETHING and we cannot tell
+            // what, so skipping it would silently widen the grant.
+            Err(Malformed) => {
+                if rule_allows {
+                    continue;
+                }
+                return false;
+            }
+        };
+        let Some(specificity) = parsed.matches(host, target.as_ref(), port, path) else {
             continue;
-        }
-        let len = rule.len();
-        match best_len {
-            Some(b) if len < b => {} // a more specific rule already decided
-            Some(b) if len == b => {
+        };
+        match best {
+            Some(b) if specificity < b => {} // a more specific rule already decided
+            Some(b) if specificity == b => {
                 // Tie on specificity: deny wins.
                 allowed = allowed && rule_allows;
             }
             _ => {
-                best_len = Some(len);
+                best = Some(specificity);
                 allowed = rule_allows;
             }
         }
     }
-    best_len.is_some() && allowed
+    best.is_some() && allowed
 }
 
-/// Whether one rule (`host[:port][/path-prefix]`) covers the target authority:
-/// host equal (case-insensitive), rule port — when present — equal to the target
-/// port (an unknown target port matches any rule port), and the rule's path
-/// segments a leading run of the target's — so `example.com/api` covers `/api/x`
-/// but not `/apixyz`. A bracketed IPv6 host (`[::1]:8080`) parses as
-/// host `[::1]`, port `8080` — the trailing-digits check keeps the address's own
-/// colons from being misread as a port.
-fn rule_matches(rule: &str, host: &str, port: Option<u16>, path: &str) -> bool {
+/// How specific a matching rule is, compared lexicographically: the HOST first (an
+/// exact host outranks every glob, and a glob with a longer suffix outranks a shorter
+/// one), then the length of the rest of the rule (`:port` and `/path`), which is how
+/// rules on one exact host have always been ranked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Specificity {
+    host: HostRank,
+    rest: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum HostRank {
+    /// A glob, ranked by the byte length of its normalized suffix. Two globs that
+    /// both match one host are both suffixes of it, so the longer is the narrower.
+    Glob(usize),
+    /// An exact host: above every glob.
+    Exact,
+}
+
+/// A rule with a `*` in its host that is not the one accepted glob form.
+#[derive(Debug, PartialEq, Eq)]
+struct Malformed;
+
+/// A host in canonical form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NormHost {
+    /// A registered name: ASCII lowercase, A-labels, no trailing dot, no empty label.
+    Domain(String),
+    /// An IPv4 literal (dotted decimal) or a bracketed IPv6 literal (`[::1]`).
+    Ip(String),
+}
+
+/// Normalize a host the way the URL parser does (WHATWG host parsing through the
+/// `url` crate's IDNA, never by hand): one trailing dot dropped, ASCII lowercased,
+/// an IDN mapped to its A-label (punycode) form, an IP literal in canonical form.
+/// `None` when it is not a host the parser accepts, or a name with an empty label.
+fn normalize_host(host: &str) -> Option<NormHost> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return None;
+    }
+    match url::Host::parse(host).ok()? {
+        url::Host::Domain(d) => {
+            if d.split('.').any(str::is_empty) {
+                None
+            } else {
+                Some(NormHost::Domain(d))
+            }
+        }
+        url::Host::Ipv4(a) => Some(NormHost::Ip(a.to_string())),
+        url::Host::Ipv6(a) => Some(NormHost::Ip(format!("[{a}]"))),
+    }
+}
+
+/// The host part of a parsed rule.
+enum RuleHost<'a> {
+    /// An exact host, kept raw (compared case-insensitively when it does not
+    /// normalize) and normalized.
+    Exact(&'a str, Option<NormHost>),
+    /// `*.<suffix>`: the normalized suffix, always a registered name.
+    Glob(String),
+}
+
+/// One parsed rule: `host[:port][/path-prefix]`.
+struct Rule<'a> {
+    host: RuleHost<'a>,
+    port: Option<u16>,
+    path: &'a str,
+    /// The byte length of `[:port][/path]`, the rule's specificity after its host.
+    rest: usize,
+}
+
+/// Parse one rule. `Ok(None)` is a rule that matches nothing (digits for a port, but
+/// out of range); `Err(Malformed)` is a `*` in the host anywhere but as a whole
+/// leftmost label followed by a registered-name suffix. A bracketed IPv6 host
+/// (`[::1]:8080`) parses as host `[::1]`, port `8080`: the trailing-digits check keeps
+/// the address's own colons from being misread as a port.
+fn parse_rule(rule: &str) -> std::result::Result<Option<Rule<'_>>, Malformed> {
     let (rule_authority, rule_path) = match rule.split_once('/') {
         Some((authority, path)) => (authority, path),
         None => (rule, ""),
@@ -413,22 +576,91 @@ fn rule_matches(rule: &str, host: &str, port: Option<u16>, path: &str) -> bool {
         Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
             match p.parse::<u16>() {
                 Ok(n) => (h, Some(n)),
-                Err(_) => return false, // digits but out of range: matches nothing
+                Err(_) => return Ok(None), // digits but out of range: matches nothing
             }
         }
         _ => (rule_authority, None),
     };
-    if !rule_host.eq_ignore_ascii_case(host) {
-        return false;
-    }
-    if let (Some(rule_port), Some(port)) = (rule_port, port) {
-        if rule_port != port {
-            return false;
+    let host = if rule_host.contains('*') {
+        // Exactly one form: `*.` followed by a suffix with no `*`, which normalizes to
+        // a registered name. That refuses `*`, `*.`, `**.com`, `*foo.com`, `foo*.com`,
+        // `a.*.com`, `*.*.com`, and a suffix that is an IP literal (`*.1`, `*.[::1]`).
+        let suffix = rule_host.strip_prefix("*.").ok_or(Malformed)?;
+        if suffix.contains('*') {
+            return Err(Malformed);
         }
+        match normalize_host(suffix) {
+            Some(NormHost::Domain(d)) => RuleHost::Glob(d),
+            _ => return Err(Malformed),
+        }
+    } else {
+        RuleHost::Exact(rule_host, normalize_host(rule_host))
+    };
+    Ok(Some(Rule {
+        host,
+        port: rule_port,
+        path: rule_path,
+        rest: rule.len() - rule_host.len(),
+    }))
+}
+
+impl Rule<'_> {
+    /// Whether this rule covers the target authority, and if so how specifically:
+    /// the host matches (below), the rule port — when present — equals the target
+    /// port (an unknown target port matches any rule port), and the rule's path
+    /// segments are a leading run of the target's — so `example.com/api` covers
+    /// `/api/x` but not `/apixyz`.
+    ///
+    /// An exact host matches when both sides normalize to the same host, or, when
+    /// either does not normalize, when they are equal ignoring ASCII case. A glob
+    /// `*.<suffix>` matches a registered name that ends in `.<suffix>` and is longer
+    /// than it, so it never matches the suffix itself, a name that merely ends in the
+    /// same letters (`xedu`), an IP literal, or a host with a `*` in it.
+    fn matches(
+        &self,
+        raw_host: &str,
+        target: Option<&NormHost>,
+        port: Option<u16>,
+        path: &str,
+    ) -> Option<Specificity> {
+        let host = match &self.host {
+            RuleHost::Exact(raw, norm) => {
+                let same = match (norm, target) {
+                    (Some(rule), Some(target)) => rule == target,
+                    _ => raw.eq_ignore_ascii_case(raw_host),
+                };
+                if !same {
+                    return None;
+                }
+                HostRank::Exact
+            }
+            RuleHost::Glob(suffix) => {
+                let Some(NormHost::Domain(name)) = target else {
+                    return None;
+                };
+                let under = name.len() > suffix.len() + 1
+                    && name.ends_with(suffix.as_str())
+                    && name.as_bytes()[name.len() - suffix.len() - 1] == b'.';
+                if !under || name.contains('*') {
+                    return None;
+                }
+                HostRank::Glob(suffix.len())
+            }
+        };
+        if let (Some(rule_port), Some(port)) = (self.port, port) {
+            if rule_port != port {
+                return None;
+            }
+        }
+        let rule_segs: Vec<&str> = self.path.split('/').filter(|s| !s.is_empty()).collect();
+        let target_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let covered = rule_segs.len() <= target_segs.len()
+            && rule_segs.iter().zip(&target_segs).all(|(r, t)| r == t);
+        covered.then_some(Specificity {
+            host,
+            rest: self.rest,
+        })
     }
-    let rule_segs: Vec<&str> = rule_path.split('/').filter(|s| !s.is_empty()).collect();
-    let target_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    rule_segs.len() <= target_segs.len() && rule_segs.iter().zip(&target_segs).all(|(r, t)| r == t)
 }
 
 /// A single outbound request, as ikigai-http hands it to the host's transport.
