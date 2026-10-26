@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Added: shared byte range helpers and vectors (ledger #2243)
+
+`range::{Range, ByteRange, ContentRange, IfRange}` parse and format RFC 9110
+field values, with checked u64 offsets, bounded lists, strong validators and
+stable refusal codes. Shared JSON vectors pin the Python and Deno wire contract.
+The endpoints also accept `if_range=` for the `If-Range` request header.
+
+### Changed: streamed transport responses with bounded collection (breaking API)
+
+`HttpResponse::body` is an owned `HttpBody` rather than `Vec<u8>`; responses are
+no longer cloneable. Canned transports use `bytes.into()`; real transports wrap
+an asynchronous reader with `HttpBody::from_reader` and return before buffering.
+Endpoints collect at most 8 MiB by default, configurable on `HttpEndpoint`, and
+return `OverBudget` on overflow. Bounds count actual bytes, independent of headers;
+HEAD, redirects and error responses drop their bodies unread. Host adapters must
+migrate to streaming readers to eliminate their own unbounded pre-buffering.
+
 ### Fixed: malformed net denies fail closed (ledger #2091)
 
 A deny with an out-of-range, nonnumeric, or empty port, or an empty host,

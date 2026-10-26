@@ -369,12 +369,12 @@ fn redirect_then_ok(location: &str) -> Arc<Seq> {
             HttpResponse {
                 status: 302,
                 headers: vec![("location".to_string(), location.to_string())],
-                body: Vec::new(),
+                body: Vec::new().into(),
             },
             HttpResponse {
                 status: 200,
                 headers: vec![("content-type".to_string(), "text/plain".to_string())],
-                body: b"reached".to_vec(),
+                body: b"reached".to_vec().into(),
             },
         ]),
         urls: Mutex::new(Vec::new()),

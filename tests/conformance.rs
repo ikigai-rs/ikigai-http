@@ -477,7 +477,7 @@ impl HttpTransport for Client {
         Ok(HttpResponse {
             status,
             headers,
-            body,
+            body: body.into(),
         })
     }
 }

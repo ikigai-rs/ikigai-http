@@ -60,7 +60,7 @@
 //! let limited = HttpResponse {
 //!     status: 429,
 //!     headers: vec![("Retry-After".into(), "120".into())],
-//!     body: Vec::new(),
+//!     body: Vec::new().into(),
 //! };
 //! let err = response_error(&limited, None, "HTTP 429").unwrap();
 //! assert_eq!(err.to_string(), "retry after 120000 ms: rate-limited: HTTP 429");
@@ -329,7 +329,7 @@ mod tests {
         HttpResponse {
             status,
             headers: vec![("retry-after".into(), value.into())],
-            body: Vec::new(),
+            body: Vec::new().into(),
         }
     }
 
@@ -363,7 +363,7 @@ mod tests {
         let none = HttpResponse {
             status: 503,
             headers: Vec::new(),
-            body: Vec::new(),
+            body: Vec::new().into(),
         };
         assert!(matches!(
             response_error(&none, now, "HTTP 503"),
@@ -373,7 +373,7 @@ mod tests {
         let shouted = HttpResponse {
             status: 503,
             headers: vec![("RETRY-AFTER".into(), "3".into())],
-            body: Vec::new(),
+            body: Vec::new().into(),
         };
         assert_eq!(
             response_error(&shouted, None, "x")

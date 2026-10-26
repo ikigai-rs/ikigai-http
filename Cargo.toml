@@ -26,6 +26,9 @@ categories = ["web-programming::http-client", "wasm"]
 # RANGE: `^0.1.108` admits every later 0.1.x, so no ceiling below the 0.1 line.
 ikigai-core = "0.1.108"
 async-trait = "0.1"
+# Runtime-independent AsyncRead for the host response-body seam.
+futures-io = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["io", "std"] }
 # URL parsing (host/path extraction for the capability ACL); runtime-free.
 url = "2"
 # The ecosystem's one base64 (ledger #1857), behind `ikigai_http::base64` so no

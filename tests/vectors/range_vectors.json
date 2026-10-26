@@ -1,0 +1,430 @@
+{
+  "version": 1,
+  "source": "RFC 9110 sections 5.6.1, 13.1.5, 14.1, 14.2, 14.4",
+  "numeric_encoding": "All byte positions and lengths are decimal strings, preserving u64 values in Python and Deno.",
+  "range": [
+    {
+      "name": "first-500",
+      "input": "bytes=0-499",
+      "canonical": "bytes=0-499"
+    },
+    {
+      "name": "second-500",
+      "input": "bytes=500-999",
+      "canonical": "bytes=500-999"
+    },
+    {
+      "name": "open",
+      "input": "bytes=9500-",
+      "canonical": "bytes=9500-"
+    },
+    {
+      "name": "suffix",
+      "input": "bytes=-500",
+      "canonical": "bytes=-500"
+    },
+    {
+      "name": "suffix-zero",
+      "input": "bytes=-0",
+      "canonical": "bytes=-0"
+    },
+    {
+      "name": "multipart",
+      "input": "bytes=0-0,-1",
+      "canonical": "bytes=0-0, -1"
+    },
+    {
+      "name": "overlap-preserved",
+      "input": "bytes=0-10,5-20",
+      "canonical": "bytes=0-10, 5-20"
+    },
+    {
+      "name": "order-preserved",
+      "input": "bytes=500-999,0-499",
+      "canonical": "bytes=500-999, 0-499"
+    },
+    {
+      "name": "ows-case-leading-zero",
+      "input": " \tBYTES=000-001,\t-002\t",
+      "canonical": "bytes=0-1, -2"
+    },
+    {
+      "name": "empty-list-elements",
+      "input": "bytes=,0-1,,",
+      "canonical": "bytes=0-1"
+    },
+    {
+      "name": "u64-max",
+      "input": "bytes=18446744073709551615-",
+      "canonical": "bytes=18446744073709551615-"
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "error": "invalid"
+    },
+    {
+      "name": "no-members",
+      "input": "bytes=",
+      "error": "invalid"
+    },
+    {
+      "name": "empty-members",
+      "input": "bytes=,,",
+      "error": "invalid"
+    },
+    {
+      "name": "inverted",
+      "input": "bytes=9-1",
+      "error": "invalid"
+    },
+    {
+      "name": "missing-hyphen",
+      "input": "bytes=5",
+      "error": "invalid"
+    },
+    {
+      "name": "double-hyphen",
+      "input": "bytes=1--2",
+      "error": "invalid"
+    },
+    {
+      "name": "negative-suffix",
+      "input": "bytes=--1",
+      "error": "invalid"
+    },
+    {
+      "name": "sign",
+      "input": "bytes=+1-2",
+      "error": "invalid"
+    },
+    {
+      "name": "internal-space",
+      "input": "bytes=1 -2",
+      "error": "invalid"
+    },
+    {
+      "name": "wrong-unit",
+      "input": "items=0-1",
+      "error": "unsupported-unit"
+    },
+    {
+      "name": "space-before-equals",
+      "input": "bytes =0-1",
+      "error": "unsupported-unit"
+    },
+    {
+      "name": "overflow-first",
+      "input": "bytes=18446744073709551616-",
+      "error": "overflow"
+    },
+    {
+      "name": "overflow-last",
+      "input": "bytes=0-18446744073709551616",
+      "error": "overflow"
+    },
+    {
+      "name": "overflow-suffix",
+      "input": "bytes=-18446744073709551616",
+      "error": "overflow"
+    },
+    {
+      "name": "non-ascii-digit",
+      "input": "bytes=\u0661-2",
+      "error": "invalid"
+    },
+    {
+      "name": "injection",
+      "input": "bytes=0-1\r\nX: bad",
+      "error": "invalid"
+    },
+    {
+      "name": "nul",
+      "input": "bytes=0-1\u0000",
+      "error": "invalid"
+    }
+  ],
+  "content_range": [
+    {
+      "name": "known",
+      "input": "bytes 42-1233/1234",
+      "canonical": "bytes 42-1233/1234"
+    },
+    {
+      "name": "unknown",
+      "input": "bytes 42-1233/*",
+      "canonical": "bytes 42-1233/*"
+    },
+    {
+      "name": "unsatisfied",
+      "input": "bytes */1234",
+      "canonical": "bytes */1234"
+    },
+    {
+      "name": "empty-representation",
+      "input": "bytes */0",
+      "canonical": "bytes */0"
+    },
+    {
+      "name": "one-byte",
+      "input": "bytes 0-0/1",
+      "canonical": "bytes 0-0/1"
+    },
+    {
+      "name": "case-ows",
+      "input": "\tBYTES 000-001/002 ",
+      "canonical": "bytes 0-1/2"
+    },
+    {
+      "name": "u64-max",
+      "input": "bytes 0-18446744073709551614/18446744073709551615",
+      "canonical": "bytes 0-18446744073709551614/18446744073709551615"
+    },
+    {
+      "name": "unknown-max-end",
+      "input": "bytes 0-18446744073709551615/*",
+      "canonical": "bytes 0-18446744073709551615/*"
+    },
+    {
+      "name": "inverted",
+      "input": "bytes 5-4/10",
+      "error": "invalid"
+    },
+    {
+      "name": "end-at-length",
+      "input": "bytes 0-10/10",
+      "error": "invalid"
+    },
+    {
+      "name": "end-past-length",
+      "input": "bytes 0-11/10",
+      "error": "invalid"
+    },
+    {
+      "name": "zero-total",
+      "input": "bytes 0-0/0",
+      "error": "invalid"
+    },
+    {
+      "name": "unknown-unsatisfied",
+      "input": "bytes */*",
+      "error": "invalid"
+    },
+    {
+      "name": "open",
+      "input": "bytes 1-/10",
+      "error": "invalid"
+    },
+    {
+      "name": "suffix",
+      "input": "bytes -1/10",
+      "error": "invalid"
+    },
+    {
+      "name": "wrong-unit",
+      "input": "items 0-1/2",
+      "error": "unsupported-unit"
+    },
+    {
+      "name": "missing-space",
+      "input": "bytes=0-1/2",
+      "error": "invalid"
+    },
+    {
+      "name": "extra-space",
+      "input": "bytes  0-1/2",
+      "error": "invalid"
+    },
+    {
+      "name": "extra-slash",
+      "input": "bytes 0-1/2/3",
+      "error": "invalid"
+    },
+    {
+      "name": "overflow",
+      "input": "bytes */18446744073709551616",
+      "error": "overflow"
+    },
+    {
+      "name": "overflow-end",
+      "input": "bytes 0-18446744073709551616/*",
+      "error": "overflow"
+    },
+    {
+      "name": "newline",
+      "input": "bytes 0-1/2\n",
+      "error": "invalid"
+    }
+  ],
+  "if_range": [
+    {
+      "name": "etag",
+      "input": "\"xyzzy\"",
+      "canonical": "\"xyzzy\""
+    },
+    {
+      "name": "empty-etag",
+      "input": "\"\"",
+      "canonical": "\"\""
+    },
+    {
+      "name": "opaque-backslash",
+      "input": "\"a\\b\"",
+      "canonical": "\"a\\b\""
+    },
+    {
+      "name": "ows",
+      "input": " \t\"etag\"\t ",
+      "canonical": "\"etag\""
+    },
+    {
+      "name": "imf",
+      "input": "Sun, 06 Nov 1994 08:49:37 GMT",
+      "canonical": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    {
+      "name": "rfc850",
+      "input": "Sunday, 06-Nov-94 08:49:37 GMT",
+      "canonical": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    {
+      "name": "asctime",
+      "input": "Sun Nov  6 08:49:37 1994",
+      "canonical": "Sun, 06 Nov 1994 08:49:37 GMT"
+    },
+    {
+      "name": "weak",
+      "input": "W/\"xyzzy\"",
+      "error": "weak-validator"
+    },
+    {
+      "name": "unquoted",
+      "input": "xyzzy",
+      "error": "invalid"
+    },
+    {
+      "name": "star",
+      "input": "*",
+      "error": "invalid"
+    },
+    {
+      "name": "unterminated",
+      "input": "\"xyzzy",
+      "error": "invalid"
+    },
+    {
+      "name": "single-quote",
+      "input": "\"",
+      "error": "invalid"
+    },
+    {
+      "name": "multiple-tags",
+      "input": "\"a\", \"b\"",
+      "error": "invalid"
+    },
+    {
+      "name": "embedded-quote",
+      "input": "\"a\"b\"",
+      "error": "invalid"
+    },
+    {
+      "name": "space-in-tag",
+      "input": "\"a b\"",
+      "error": "invalid"
+    },
+    {
+      "name": "tab-in-tag",
+      "input": "\"a\tb\"",
+      "error": "invalid"
+    },
+    {
+      "name": "del-in-tag",
+      "input": "\"a\u007fb\"",
+      "error": "invalid"
+    },
+    {
+      "name": "crlf",
+      "input": "\"a\"\r\nX: b",
+      "error": "invalid"
+    },
+    {
+      "name": "bad-date",
+      "input": "Sun, 99 Nov 1994 08:49:37 GMT",
+      "error": "invalid"
+    }
+  ],
+  "resolve": [
+    {
+      "name": "closed",
+      "range": "bytes=0-499",
+      "length": "1234",
+      "expect": [
+        "0",
+        "499"
+      ]
+    },
+    {
+      "name": "clamped-end",
+      "range": "bytes=500-9999",
+      "length": "1234",
+      "expect": [
+        "500",
+        "1233"
+      ]
+    },
+    {
+      "name": "open",
+      "range": "bytes=500-",
+      "length": "1234",
+      "expect": [
+        "500",
+        "1233"
+      ]
+    },
+    {
+      "name": "suffix",
+      "range": "bytes=-500",
+      "length": "1234",
+      "expect": [
+        "734",
+        "1233"
+      ]
+    },
+    {
+      "name": "clamped-suffix",
+      "range": "bytes=-9999",
+      "length": "1234",
+      "expect": [
+        "0",
+        "1233"
+      ]
+    },
+    {
+      "name": "zero-suffix",
+      "range": "bytes=-0",
+      "length": "1234",
+      "expect": null
+    },
+    {
+      "name": "empty",
+      "range": "bytes=0-0",
+      "length": "0",
+      "expect": null
+    },
+    {
+      "name": "past-end",
+      "range": "bytes=1234-",
+      "length": "1234",
+      "expect": null
+    },
+    {
+      "name": "max-length",
+      "range": "bytes=-1",
+      "length": "18446744073709551615",
+      "expect": [
+        "18446744073709551614",
+        "18446744073709551614"
+      ]
+    }
+  ]
+}
