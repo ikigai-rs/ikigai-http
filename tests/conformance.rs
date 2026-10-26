@@ -533,17 +533,16 @@ fn suite(origin: &Origin, path: &str, space: &Arc<Alias>) -> Suite {
 }
 
 /// The walk saw eight endpoints, one action each (the deprecated aliases are not
-/// enumerated, so they are not a ninth to fourteenth), skipped only FAILURES, waived
+/// enumerated, so they are not a ninth to fourteenth), skipped no checks, waived
 /// exactly OUTPUTS on exactly the seven pass-through ids, and opted no endpoint out
 /// wholesale. A ninth endpoint bound without a line here, or a check quietly
 /// waived, is held to a weaker standard.
 fn assert_shape(report: &Report) {
     assert_eq!(report.endpoints, METHODS.len(), "{report}");
     assert_eq!(report.actions, METHODS.len(), "one action each: {report}");
-    assert_eq!(
-        report.checks.skipped().collect::<Vec<_>>(),
-        vec![Check::Failures],
-        "only FAILURES is skipped (OFF until a suite opts in): {report}"
+    assert!(
+        report.checks.skipped().next().is_none(),
+        "all checks run, including DATATYPES and FAILURES: {report}"
     );
     assert!(
         report.declared.opted_out.is_empty(),
