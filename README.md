@@ -26,7 +26,7 @@ the method — so "is this cached?" falls straight out of the verb:
 
 The URL is an argument (`url=`, an `xsd:anyURI`, the only required input), so one
 binding serves every URL and the cache keys on the URL. Optional args set request
-headers: `accept`, `authorization`, `range`, and a generic `headers=` block (one
+headers: `accept`, `authorization`, `range`, `if_range`, and a generic `headers=` block (one
 `Name: Value` per line); every method but GET and HEAD also takes `content=` (the
 body) and `content_type=`. Every input is typed in the manifold, so `urn:kernel:actions`
 and the MCP projection state the contract an agent can form a call from.
@@ -138,6 +138,49 @@ let space = ikigai_http::space(Arc::new(MyTransport));
 deprecated names resolve); hold it as an `Arc<dyn Space>`. `endpoints` returns the
 bare `EndpointSpace` without the aliases, and `deprecated_aliases` the rewrite table,
 for a host that wants it at `urn:kernel:aliases` too (`Kernel::with_aliases`).
+
+## Ranges and bounded response bodies
+
+`ikigai_http::range` is the shared RFC 9110 implementation for `Range`,
+`Content-Range`, and `If-Range`. Parse with `FromStr`, format with `Display`:
+
+```rust
+use ikigai_http::range::{Range, ContentRange, IfRange};
+let range: Range = "bytes=0-499, -500".parse()?;
+assert_eq!(range.ranges()[1].resolve(1234), Some((734, 1233)));
+let content: ContentRange = "bytes 0-499/1234".parse()?;
+assert_eq!(content.interval(), Some((0, 499)));
+let validator: IfRange = "\"v1\"".parse()?;
+# Ok::<(), ikigai_http::range::ParseError>(())
+```
+
+Positions and lengths are checked `u64`s; intervals are inclusive. Open and
+suffix ranges resolve against a known length, clamping excessive ends. A suffix
+of zero is syntactically valid but unsatisfiable. Order and overlap are preserved.
+Unknown units, numeric overflow, inverted intervals, and invalid complete lengths
+are refused with stable `ParseError::code()` values. Fields are limited to 16 KiB
+and range lists to 128 members (including ignored empty members). Weak `If-Range`
+tags are refused; HTTP dates use `httpdate`, including obsolete input formats,
+and format as IMF-fixdate. The caller must establish that a date is a strong
+validator. Multipart assembly and conditional evaluation remain caller policy.
+`tests/vectors/range_vectors.json` pins these rules for Python and Deno; decimal
+positions are strings so JavaScript never rounds them.
+
+**Transport API change:** `HttpResponse::body` is now an owned `HttpBody`, and
+`HttpResponse` no longer implements `Clone`. Canned responses migrate from
+`body: bytes` to `body: bytes.into()`. Real transports must return headers and
+`HttpBody::from_reader(reader)` before collecting the response, and stop reads
+when the reader is dropped. The reader uses `futures_io::AsyncRead + Send`, with
+no required executor or HTTP client. Direct consumers can call `into_reader()`
+for incremental reads or `collect(limit)` for bounded collection.
+
+Endpoints still return core's buffered `Representation`, collecting at most
+8 MiB by default. `HttpEndpoint::with_max_response_bytes(limit)` lets a host set
+another limit. Collection counts actual bytes regardless of `Content-Length`,
+probes at most one extra byte, and returns typed `OverBudget` on overflow. HEAD,
+redirects, and error statuses drop bodies unread. A bounded collector cannot
+undo allocation inside a transport that buffers first: hosts must adopt the
+reader seam to bound their network reads.
 
 ## Authorization headers and base64
 

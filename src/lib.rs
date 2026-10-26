@@ -255,7 +255,10 @@ use url::Url;
 
 pub mod auth;
 pub mod base64;
+pub mod body;
+pub mod range;
 pub mod status;
+pub use body::{HttpBody, DEFAULT_MAX_RESPONSE_BYTES};
 
 /// The XSD datatypes the inputs declare: the URL is an IRI, a header value is a
 /// string, a freshness window is a count of seconds.
@@ -670,12 +673,12 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
-/// The host transport's reply.
-#[derive(Clone, Debug)]
+/// The host transport's reply. The body is consumed once; dropping it stops reads.
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: HttpBody,
 }
 
 impl HttpResponse {
@@ -694,6 +697,12 @@ impl HttpResponse {
 /// Tokio) is baked into this crate. Async so a real client can await; boxed via
 /// `async-trait` so the executor is still chosen at the edge.
 ///
+/// Return headers before collecting the body. Wrap the client's asynchronous
+/// reader with [`HttpBody::from_reader`]; do not buffer an unbounded response
+/// inside `send`. Dropping a body must stop further reads. The endpoint counts
+/// actual bytes as it collects them, with an 8 MiB default limit (configurable
+/// through [`HttpEndpoint::with_max_response_bytes`]), regardless of Content-Length.
+///
 /// **Contract: a transport must NOT follow redirects.** A 3xx response is
 /// returned as-is; the endpoint follows it (for cacheable methods only), because
 /// only the endpoint can re-run the capability ACL against the redirect target —
@@ -710,12 +719,23 @@ pub trait HttpTransport: Send + Sync {
 pub struct HttpEndpoint {
     method: Method,
     transport: Arc<dyn HttpTransport>,
+    max_response_bytes: usize,
 }
 
 impl HttpEndpoint {
     /// An endpoint for `method`, performing I/O through `transport`.
     pub fn new(method: Method, transport: Arc<dyn HttpTransport>) -> Self {
-        HttpEndpoint { method, transport }
+        HttpEndpoint {
+            method,
+            transport,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        }
+    }
+    /// Set the host's collection limit. HEAD, redirects and error statuses drop
+    /// the body unread; successful responses are collected within this limit.
+    pub fn with_max_response_bytes(mut self, limit: usize) -> Self {
+        self.max_response_bytes = limit;
+        self
     }
 }
 
@@ -856,7 +876,9 @@ impl Endpoint for HttpEndpoint {
         }
 
         let window = freshness_window(&response, inv);
-        let repr = Representation::new(content_type(&response), response.body);
+        let repr_type = content_type(&response);
+        let bytes = response.body.collect(self.max_response_bytes).await?;
+        let repr = Representation::new(repr_type, bytes);
         if self.method.is_cacheable() {
             return Ok(with_freshness(repr, window, inv, &thread));
         }
@@ -923,6 +945,10 @@ impl Endpoint for HttpEndpoint {
             .input(header(
                 "range",
                 "value for the Range header, e.g. bytes=0-1023",
+            ))
+            .input(header(
+                "if_range",
+                "strong entity tag or HTTP-date for If-Range",
             ))
             .input(header(
                 "headers",
@@ -1078,6 +1104,7 @@ fn request_headers(inv: &Invocation<'_>) -> Vec<(String, String)> {
         ("accept", "Accept"),
         ("authorization", "Authorization"),
         ("range", "Range"),
+        ("if_range", "If-Range"),
         ("content_type", "Content-Type"),
     ] {
         if let Ok(value) = inv.inline_str(arg) {
@@ -1337,13 +1364,13 @@ mod tests {
     /// shows up as a GET not reaching the wire).
     struct Mock {
         gets: AtomicU32,
-        response: HttpResponse,
+        response: std::sync::Mutex<HttpResponse>,
     }
     impl Mock {
         fn new(response: HttpResponse) -> Self {
             Mock {
                 gets: AtomicU32::new(0),
-                response,
+                response: std::sync::Mutex::new(response),
             }
         }
         fn gets(&self) -> u32 {
@@ -1356,7 +1383,20 @@ mod tests {
             if request.method == Method::Get {
                 self.gets.fetch_add(1, Ordering::SeqCst);
             }
-            Ok(self.response.clone())
+            Ok(clone_buffered_response(&self.response.lock().unwrap()))
+        }
+    }
+
+    fn clone_buffered_response(response: &HttpResponse) -> HttpResponse {
+        HttpResponse {
+            status: response.status,
+            headers: response.headers.clone(),
+            body: response
+                .body
+                .as_bytes()
+                .expect("buffered fixture")
+                .to_vec()
+                .into(),
         }
     }
 
@@ -1368,13 +1408,29 @@ mod tests {
         HttpResponse {
             status: 200,
             headers,
-            body: b"hi".to_vec(),
+            body: b"hi".to_vec().into(),
         }
     }
 
     fn get(url: &str) -> Request {
         Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
             .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn oversized_response_is_over_budget() {
+        let mut response = resp(None);
+        response.body = vec![0; 8 * 1024 * 1024 + 1].into();
+        let ep = HttpEndpoint::new(Method::Get, Arc::new(Mock::new(response)));
+        let cap = Capability::root();
+        let req = get("https://example.com/large");
+        let bindings = ikigai_core::Bindings::new();
+        let inv = Invocation::detached(&req, &bindings, &cap);
+        let result = futures::executor::block_on(ep.invoke(&inv));
+        assert!(
+            matches!(result, Err(Error::OverBudget { .. })),
+            "an oversized response must be refused"
+        );
     }
 
     #[test]
@@ -1581,12 +1637,14 @@ mod tests {
             .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()))
             .with_arg("accept", ArgRef::Inline(b"application/json".to_vec()))
             .with_arg("range", ArgRef::Inline(b"bytes=0-1023".to_vec()))
+            .with_arg("if_range", ArgRef::Inline(b"\"v1\"".to_vec()))
             .with_arg("headers", ArgRef::Inline(b"X-Foo: bar\nX-Empty:".to_vec()));
         futures::executor::block_on(kernel.issue(req, &cap)).unwrap();
 
         let sent = transport.0.lock().unwrap().clone();
         assert!(sent.contains(&("Accept".to_string(), "application/json".to_string())));
         assert!(sent.contains(&("Range".to_string(), "bytes=0-1023".to_string())));
+        assert!(sent.contains(&("If-Range".to_string(), "\"v1\"".to_string())));
         assert!(sent.contains(&("X-Foo".to_string(), "bar".to_string())));
         assert!(sent.contains(&("X-Empty".to_string(), String::new())));
     }
@@ -1622,7 +1680,7 @@ mod tests {
             Ok(HttpResponse {
                 status: self.code,
                 headers,
-                body: b"body".to_vec(),
+                body: b"body".to_vec().into(),
             })
         }
     }
@@ -1707,7 +1765,7 @@ mod tests {
             Ok(HttpResponse {
                 status: self.status,
                 headers: vec![("Retry-After".to_string(), self.retry_after.to_string())],
-                body: Vec::new(),
+                body: Vec::new().into(),
             })
         }
     }
@@ -1958,7 +2016,7 @@ mod tests {
             Ok(if scripted.len() > 1 {
                 scripted.remove(0)
             } else {
-                scripted[0].clone()
+                clone_buffered_response(&scripted[0])
             })
         }
     }
@@ -1967,7 +2025,7 @@ mod tests {
         HttpResponse {
             status,
             headers: vec![("location".to_string(), location.to_string())],
-            body: Vec::new(),
+            body: Vec::new().into(),
         }
     }
 
@@ -1975,7 +2033,7 @@ mod tests {
         HttpResponse {
             status: 200,
             headers: vec![("content-type".to_string(), "text/plain".to_string())],
-            body: body.as_bytes().to_vec(),
+            body: body.as_bytes().to_vec().into(),
         }
     }
 
@@ -2098,13 +2156,13 @@ mod tests {
     /// the same response.
     struct Record {
         requests: std::sync::Mutex<Vec<HttpRequest>>,
-        response: HttpResponse,
+        response: std::sync::Mutex<HttpResponse>,
     }
     impl Record {
         fn new(response: HttpResponse) -> Arc<Self> {
             Arc::new(Record {
                 requests: std::sync::Mutex::new(Vec::new()),
-                response,
+                response: std::sync::Mutex::new(response),
             })
         }
         fn requests(&self) -> Vec<HttpRequest> {
@@ -2115,7 +2173,7 @@ mod tests {
     impl HttpTransport for Record {
         async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
             self.requests.lock().unwrap().push(request);
-            Ok(self.response.clone())
+            Ok(clone_buffered_response(&self.response.lock().unwrap()))
         }
     }
 
@@ -2126,7 +2184,7 @@ mod tests {
                 "Content-Type".to_string(),
                 "application/xml; charset=utf-8".to_string(),
             )],
-            body: b"<d:multistatus xmlns:d=\"DAV:\"/>".to_vec(),
+            body: b"<d:multistatus xmlns:d=\"DAV:\"/>".to_vec().into(),
         }
     }
 
