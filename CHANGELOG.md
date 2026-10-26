@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed: core 0.2.0 streams release (breaking API, ledger #2261)
+
+Bump `ikigai-http` to 0.4.0 and depend on `ikigai-core` 0.2.0. Core's types
+appear in the public API, so consumers must migrate together to keep one core
+in their dependency graph. The previous 0.1 pin excluded 0.2.0 under Cargo's
+0.x rules. Upgrade the conformance suite to 0.11.0, enabling its DATATYPES and
+FAILURES checks by default. The conformance assertions now require every check
+to run, replacing the old expectation that FAILURES was skipped.
+
 ### Added: shared byte range helpers and vectors (ledger #2243)
 
 `range::{Range, ByteRange, ContentRange, IfRange}` parse and format RFC 9110
