@@ -701,7 +701,7 @@ impl HttpResponse {
 /// reader with [`HttpBody::from_reader`]; do not buffer an unbounded response
 /// inside `send`. Dropping a body must stop further reads. The endpoint counts
 /// actual bytes as it collects them, with an 8 MiB default limit (configurable
-/// through [`HttpEndpoint::with_max_response_bytes`]), regardless of Content-Length.
+/// through [`space_with`] or [`HttpEndpoint::with_max_response_bytes`]), regardless of Content-Length.
 ///
 /// **Contract: a transport must NOT follow redirects.** A 3xx response is
 /// returned as-is; the endpoint follows it (for cacheable methods only), because
@@ -998,6 +998,8 @@ impl Endpoint for HttpEndpoint {
 /// names (`urn:httpGet` … `urn:httpDelete`) as deprecated aliases of the first six,
 /// through 0.3.x (see [`deprecated_aliases`]).
 ///
+/// Responses use the 8 MiB default limit; use [`space_with`] to set another limit.
+///
 /// The space is an [`Alias`] over the eight bindings ([`endpoints`]): the overlay
 /// core provides for exactly this migration, so an old name shares its new name's
 /// cache entry and golden thread, describes itself by the new id, and is absent
@@ -1024,9 +1026,36 @@ impl Endpoint for HttpEndpoint {
 /// assert_eq!(old.id, new.id);
 /// ```
 pub fn space(transport: Arc<dyn HttpTransport>) -> Alias {
+    space_with(transport, DEFAULT_MAX_RESPONSE_BYTES)
+}
+
+/// Mount the same endpoints and deprecated aliases as [`space`], with the host's
+/// response-body collection limit in bytes applied to every method.
+///
+/// The limit counts actual body bytes, regardless of `Content-Length`. A body
+/// exceeding it returns [`Error::OverBudget`], never a truncated response. Zero
+/// permits only empty bodies. HEAD, redirects, and error statuses drop bodies
+/// unread. [`space`] keeps its 8 MiB default.
+///
+/// This is a per-response HTTP limit, independent of the run's byte budget
+/// (`urn:cap:stream:memory:<bytes>`). These endpoints collect into an already
+/// buffered [`Representation`], which core does not charge to the run's stream
+/// memory pool; a smaller run budget therefore does not lower this HTTP limit.
+/// Where a later operation also buffers streams under the run's budget, it must
+/// satisfy that budget as well: neither setting overrides the other, and a
+/// memory grant cannot raise this HTTP limit.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use ikigai_http::HttpTransport;
+/// fn mount(transport: Arc<dyn HttpTransport>) -> ikigai_core::Alias {
+///     ikigai_http::space_with(transport, 16 * 1024 * 1024)
+/// }
+/// ```
+pub fn space_with(transport: Arc<dyn HttpTransport>, max_response_bytes: usize) -> Alias {
     Alias::new(
         Arc::new(deprecated_aliases()),
-        Arc::new(endpoints(transport)),
+        Arc::new(endpoints_with_limit(transport, max_response_bytes)),
     )
 }
 
@@ -1034,11 +1063,19 @@ pub fn space(transport: Arc<dyn HttpTransport>) -> Alias {
 /// [`space`] wraps. For a host that has migrated every caller and wants the old
 /// names to miss now rather than when the aliases are removed.
 pub fn endpoints(transport: Arc<dyn HttpTransport>) -> EndpointSpace {
+    endpoints_with_limit(transport, DEFAULT_MAX_RESPONSE_BYTES)
+}
+
+fn endpoints_with_limit(
+    transport: Arc<dyn HttpTransport>,
+    max_response_bytes: usize,
+) -> EndpointSpace {
     let mut space = EndpointSpace::new();
     for method in Method::ALL {
         space = space.bind(
             Exact::new(method.iri()),
-            HttpEndpoint::new(method, transport.clone()),
+            HttpEndpoint::new(method, transport.clone())
+                .with_max_response_bytes(max_response_bytes),
         );
     }
     space
