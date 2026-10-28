@@ -177,6 +177,15 @@
 //! a request body): a 3xx with a `Location` on `POST`/`PUT`/`PATCH`/`DELETE`/
 //! `PROPFIND`/`REPORT` is a typed error naming the target instead.
 //!
+//! When a redirect changes origin (scheme, host, or effective port), the endpoint
+//! removes `Authorization`, `Proxy-Authorization`, and `Cookie`, case-insensitively,
+//! including values supplied through `headers=`. They stay removed on every later
+//! hop, even one returning to the original origin. Same-origin redirects preserve
+//! them; other headers are preserved on every hop. This follows the credential
+//! isolation principle in Fetch's [HTTP-redirect fetch](https://fetch.spec.whatwg.org/#http-redirect-fetch)
+//! and [curl's restriction on forwarding Authorization](https://curl.se/docs/CVE-2018-1000007.html).
+//! A caller who needs a credential on the target must call the target directly.
+//!
 //! The credential to authenticate with (when one is needed) is itself meant to be
 //! capability-gated — the agent gets "may call host X with credential Y", never the
 //! raw token — but that, and headers/body/range/auth args, land with the backend.
@@ -762,7 +771,7 @@ impl Endpoint for HttpEndpoint {
         } else {
             Vec::new()
         };
-        let headers = request_headers(inv);
+        let mut headers = request_headers(inv);
 
         // Follow redirects here — never in the transport — so the capability ACL
         // runs against EVERY hop's authority, not just the first (the transport
@@ -837,6 +846,15 @@ impl Endpoint for HttpEndpoint {
                 Error::Endpoint(format!("invalid redirect Location `{location}`: {e}"))
             })?;
             current.set_fragment(None);
+            if current.origin() != parsed.origin() {
+                // Mutate the shared list so credentials stay stripped even if
+                // a later redirect returns to the original origin.
+                headers.retain(|(name, _)| {
+                    !["Authorization", "Proxy-Authorization", "Cookie"]
+                        .iter()
+                        .any(|credential| name.eq_ignore_ascii_case(credential))
+                });
+            }
         };
 
         // HEAD answers *existence*, per the `ikigai-fs` convention: a `"true"`/`"false"` text
@@ -1996,12 +2014,14 @@ mod tests {
     struct Seq {
         responses: std::sync::Mutex<Vec<HttpResponse>>,
         urls: std::sync::Mutex<Vec<String>>,
+        headers: std::sync::Mutex<Vec<Vec<(String, String)>>>,
     }
     impl Seq {
         fn new(responses: Vec<HttpResponse>) -> Arc<Self> {
             Arc::new(Seq {
                 responses: std::sync::Mutex::new(responses),
                 urls: std::sync::Mutex::new(Vec::new()),
+                headers: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn urls(&self) -> Vec<String> {
@@ -2012,6 +2032,7 @@ mod tests {
     impl HttpTransport for Seq {
         async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
             self.urls.lock().unwrap().push(request.url.clone());
+            self.headers.lock().unwrap().push(request.headers.clone());
             let mut scripted = self.responses.lock().unwrap();
             Ok(if scripted.len() > 1 {
                 scripted.remove(0)
@@ -2060,6 +2081,82 @@ mod tests {
             ],
             "both hops went over the wire, in order"
         );
+    }
+
+    #[test]
+    fn cross_origin_redirect_drops_credentials() {
+        let transport = Seq::new(vec![redirect_to(302, "https://b.example/"), ok_body("ok")]);
+        let kernel = Kernel::new(Arc::new(space(transport.clone())));
+        let cap = Capability::root().attenuate([
+            "urn:cap:net:a.example".to_string(),
+            "urn:cap:net:b.example".to_string(),
+        ]);
+        let request = get("https://a.example/")
+            .with_arg("authorization", ArgRef::Inline(b"Bearer secret".to_vec()))
+            .with_arg(
+                "headers",
+                ArgRef::Inline(b"Cookie: session=secret".to_vec()),
+            );
+        futures::executor::block_on(kernel.issue(request, &cap)).unwrap();
+        let headers = transport.headers.lock().unwrap();
+        assert_eq!(headers[0].len(), 2);
+        assert!(
+            headers[1].is_empty(),
+            "credentials leaked: {:?}",
+            headers[1]
+        );
+    }
+
+    #[test]
+    fn redirect_credentials_follow_origin_boundaries() {
+        let cases: &[(&[&str], &[bool])] = &[
+            (
+                &["https://b.example/", "https://a.example/back"],
+                &[true, false, false],
+            ),
+            (&["http://a.example/"], &[true, false]),
+            (&["https://a.example:8443/"], &[true, false]),
+            (
+                &["/relative", "https://A.EXAMPLE:443/final"],
+                &[true, true, true],
+            ),
+        ];
+        for method in [Method::Get, Method::Head] {
+            for (targets, credentials_expected) in cases {
+                let mut responses: Vec<_> =
+                    targets.iter().map(|url| redirect_to(302, url)).collect();
+                responses.push(ok_body("ok"));
+                let transport = Seq::new(responses);
+                let kernel = Kernel::new(Arc::new(space(transport.clone())));
+                let cap = Capability::root().attenuate([
+                    "urn:cap:net:a.example".to_string(),
+                    "urn:cap:net:b.example".to_string(),
+                ]);
+                let request = Request::new(method.verb(), Iri::parse(method.iri()).unwrap())
+                    .with_arg("url", ArgRef::Inline(b"https://a.example/".to_vec()))
+                    .with_arg("authorization", ArgRef::Inline(b"Bearer convenience".to_vec()))
+                    .with_arg("headers", ArgRef::Inline(
+                        b"aUtHoRiZaTiOn: Bearer custom\nAUTHORIZATION: duplicate\npRoXy-AuThOrIzAtIoN: proxy\ncOoKiE: session=secret\nCookie: duplicate\nAccept: text/plain\nRange: bytes=0-9".to_vec()
+                    ));
+                futures::executor::block_on(kernel.issue(request, &cap)).unwrap();
+                let headers = transport.headers.lock().unwrap();
+                assert_eq!(headers.len(), credentials_expected.len());
+                let original = &headers[0];
+                let public: Vec<_> = original
+                    .iter()
+                    .filter(|(name, _)| name == "Accept" || name == "Range")
+                    .cloned()
+                    .collect();
+                assert_eq!(public.len(), 2);
+                for (hop, expected) in headers.iter().zip(*credentials_expected) {
+                    assert_eq!(
+                        hop,
+                        if *expected { original } else { &public },
+                        "{method:?}: {targets:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
