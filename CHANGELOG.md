@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.4.2
 
 ### Security: strip credentials on cross-origin redirects (ledger #2459)
 
@@ -10,8 +10,6 @@ Header matching is case-insensitive and covers convenience arguments and
 `headers=`. Once removed, credentials stay removed even on a return to the
 original origin. Same-origin redirects preserve credentials; other headers stay
 intact. Call the target directly if it needs a credential.
-
-## 0.4.0
 
 ## 0.4.1
 
