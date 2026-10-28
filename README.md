@@ -175,8 +175,12 @@ no required executor or HTTP client. Direct consumers can call `into_reader()`
 for incremental reads or `collect(limit)` for bounded collection.
 
 Endpoints still return core's buffered `Representation`, collecting at most
-8 MiB by default. `HttpEndpoint::with_max_response_bytes(limit)` lets a host set
-another limit. Collection counts actual bytes regardless of `Content-Length`,
+8 MiB by default. `space_with(transport, max_response_bytes)` sets another limit
+for all mounted endpoints; `space(transport)` keeps the default. Individual
+endpoints use `HttpEndpoint::with_max_response_bytes(limit)`. These endpoints
+return an already buffered representation, so core does not charge this collection
+to the run’s separate `urn:cap:stream:memory:<bytes>` pool. A memory grant does
+not raise the HTTP limit. Collection counts actual bytes regardless of `Content-Length`,
 probes at most one extra byte, and returns typed `OverBudget` on overflow. HEAD,
 redirects, and error statuses drop bodies unread. A bounded collector cannot
 undo allocation inside a transport that buffers first: hosts must adopt the

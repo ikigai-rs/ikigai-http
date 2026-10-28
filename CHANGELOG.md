@@ -13,6 +13,18 @@ intact. Call the target directly if it needs a credential.
 
 ## 0.4.0
 
+## 0.4.1
+
+### Added: host response budget through `space_with` (ledger #2442)
+
+`space_with(transport, max_response_bytes)` applies the host's response limit to
+all eight endpoints and their deprecated aliases. A 12 MiB body can now pass
+with a 16 MiB limit. Overflow remains `OverBudget`, never truncation; `space()`
+and `endpoints()` retain the 8 MiB default. The API documents how this limit
+relates to core's separate run stream-memory budget.
+
+## 0.4.0
+
 ### Changed: core 0.2.0 streams release (breaking API, ledger #2261)
 
 Bump `ikigai-http` to 0.4.0 and depend on `ikigai-core` 0.2.0. Core's types
