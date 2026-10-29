@@ -1517,6 +1517,80 @@ mod tests {
         assert!(!err.is_transient());
     }
 
+    /// A caller-supplied validator must produce an explicit, uncacheable 304
+    /// result, even when either side supplies a freshness window.
+    #[test]
+    fn not_modified_is_explicit_and_never_cached() {
+        struct ConditionalOrigin {
+            status: u16,
+            sends: AtomicU32,
+        }
+        #[async_trait]
+        impl HttpTransport for ConditionalOrigin {
+            async fn send(
+                &self,
+                request: HttpRequest,
+            ) -> std::result::Result<HttpResponse, String> {
+                assert!(request
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("if-none-match")
+                        && value == "\"abc\""));
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: self.status,
+                    headers: vec![("Cache-Control".into(), "max-age=600".into())],
+                    body: if self.status == 200 {
+                        b"content".to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                    .into(),
+                })
+            }
+        }
+        for status in [304, 200] {
+            for max_age in [None, Some("600")] {
+                let transport = Arc::new(ConditionalOrigin {
+                    status,
+                    sends: AtomicU32::new(0),
+                });
+                let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                    .with_clock(Arc::new(TestClock::at(0)));
+                let mut request = get("https://example.com/conditional").with_arg(
+                    "headers",
+                    ArgRef::Inline(b"If-None-Match: \"abc\"".to_vec()),
+                );
+                if let Some(age) = max_age {
+                    request = request.with_arg("max_age", ArgRef::Inline(age.as_bytes().to_vec()));
+                }
+                for _ in 0..2 {
+                    let repr = futures::executor::block_on(
+                        kernel.issue(request.clone(), &Capability::root()),
+                    )
+                    .unwrap();
+                    if status == 304 {
+                        assert_eq!(
+                            repr.repr_type.params.get("http-status").map(String::as_str),
+                            Some("304"),
+                            "304 must be distinguishable from an empty success"
+                        );
+                        assert!(repr.bytes.is_empty());
+                        assert_eq!(repr.expiry, ikigai_core::Expiry::Always);
+                    } else {
+                        assert_eq!(repr.bytes, b"content");
+                        assert!(!repr.repr_type.params.contains_key("http-status"));
+                    }
+                }
+                assert_eq!(
+                    transport.sends.load(Ordering::SeqCst),
+                    if status == 304 { 2 } else { 1 },
+                    "304 must reach the origin again; 200 retains normal caching"
+                );
+            }
+        }
+    }
+
     #[test]
     fn cacheable_get_serves_until_max_age_then_recomputes() {
         let transport = Arc::new(Mock::new(resp(Some("max-age=60"))));
