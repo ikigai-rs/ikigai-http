@@ -92,7 +92,7 @@ transport that gives up waiting is `Timeout`; any other transport failure is
 `Unavailable`. `Denied` is now only the capability floor's word: our grant did not
 cover the URL. Each action declares its failure classes (`Description::fails`), so
 the manifold says what can go wrong before anything does. HEAD stays lenient: any
-answered status but 404/410 is `true`.
+answered status but 404/410 is `true`, except for the explicit 304 result below.
 
 ```rust
 use ikigai_http::status::status_error;
@@ -121,6 +121,16 @@ A cacheable GET/HEAD is threaded on its URL — a later mutating call to the sam
 cuts that thread and recomputes it — and, when the response carries
 `Cache-Control: max-age`, cached until that deadline (enforced by the kernel's
 injected `Clock`). With no freshness signal a read stays live (uncacheable).
+
+### Conditional requests: 304 Not Modified
+
+When an origin answers `304`, every endpoint returns an empty representation
+with `repr_type.params["http-status"] = "304"`. This is a distinct status result,
+not the URL's content. It is always uncacheable, even with response `max-age` or
+a caller `max_age`, and its body is dropped unread. HEAD uses `text/plain` for
+this result; other methods use the origin's content type or the usual fallback.
+Callers sending validators through `headers=` must inspect this metadata and
+reuse their own saved content. The module does not revalidate automatically.
 
 ## Host transport
 

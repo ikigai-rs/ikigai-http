@@ -232,13 +232,19 @@
 //! ```
 //! - `HEAD`/`exists`: a `"true"`/`"false"` text representation, following the `ikigai-fs` `Exists`
 //!   convention (existence is an answer, not an error). Existence is **lenient**: the check is only
-//!   reached once the server has answered, so any status but 404/410 means the host is reachable and
+//!   reached once the server has answered, so any status but 304/404/410 means the host is reachable and
 //!   the endpoint is *present* (`true`) — a 429 throttle, a 5xx error, a 408/504 timeout all count
 //!   as there-but-busy. Only 404/410 is *absent* (`false`); only a transport failure (which errors
 //!   before the status is seen) is unreachable. This is deliberately more lenient than `Source`:
 //!   `Exists` asks "is it there?", `Source` asks "give it to me" (where a 429/5xx is an honest
 //!   transient error). A link-checker leans on the split — a bookmark whose host answers `429`/`503`
 //!   is not dead.
+//!
+//! A `304 Not Modified` is the exception on every method: an empty representation
+//! with `repr_type.params["http-status"] = "304"`, always uncacheable even with
+//! origin or caller freshness. Its body is dropped unread and no mutation thread
+//! is cut. A caller sending validators must inspect this metadata and reuse its
+//! own saved content; the endpoint does not revalidate automatically.
 //!
 //! ## Caching (needs `ikigai-core` ≥ 0.1.12)
 //!
@@ -857,6 +863,21 @@ impl Endpoint for HttpEndpoint {
             }
         };
 
+        // A 304 carries no content to serve or cache. Preserve the status in the
+        // representation type and return before freshness or mutation handling,
+        // even when the caller supplied max_age. Drop the transport body unread.
+        if response.status == 304 {
+            let repr_type = if self.method == Method::Head {
+                ReprType::new("text/plain")
+            } else {
+                content_type(&response)
+            };
+            return Ok(Representation::new(
+                repr_type.with_param("http-status", "304"),
+                Vec::new(),
+            ));
+        }
+
         // HEAD answers *existence*, per the `ikigai-fs` convention: a `"true"`/`"false"` text
         // representation for a definitive presence answer, a typed error when the status doesn't
         // speak to presence. No opinion about what's "dead" — the caller reads the honest signal.
@@ -915,7 +936,8 @@ impl Endpoint for HttpEndpoint {
     fn describe(&self) -> Description {
         let summary = if self.method == Method::Head {
             "Ask whether a URL is present (`true`/`false`) with an HTTP HEAD through a host \
-             transport, capability-gated by `urn:cap:net`."
+             transport, capability-gated by `urn:cap:net`; a 304 is an empty, uncacheable \
+             result with `http-status=304` type metadata."
         } else if self.method == Method::Propfind {
             "Send a WebDAV PROPFIND (RFC 4918) to a URL through a host transport, \
              capability-gated by `urn:cap:net`: `content` is the XML request, `Depth` goes in \
@@ -1515,6 +1537,80 @@ mod tests {
         // `Endpoint` string, and never transient (re-issuing won't change the answer).
         assert!(matches!(err, Error::Denied(_)), "got {err:?}");
         assert!(!err.is_transient());
+    }
+
+    /// A caller-supplied validator must produce an explicit, uncacheable 304
+    /// result, even when either side supplies a freshness window.
+    #[test]
+    fn not_modified_is_explicit_and_never_cached() {
+        struct ConditionalOrigin {
+            status: u16,
+            sends: AtomicU32,
+        }
+        #[async_trait]
+        impl HttpTransport for ConditionalOrigin {
+            async fn send(
+                &self,
+                request: HttpRequest,
+            ) -> std::result::Result<HttpResponse, String> {
+                assert!(request
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("if-none-match")
+                        && value == "\"abc\""));
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: self.status,
+                    headers: vec![("Cache-Control".into(), "max-age=600".into())],
+                    body: if self.status == 200 {
+                        b"content".to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                    .into(),
+                })
+            }
+        }
+        for status in [304, 200] {
+            for max_age in [None, Some("600")] {
+                let transport = Arc::new(ConditionalOrigin {
+                    status,
+                    sends: AtomicU32::new(0),
+                });
+                let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                    .with_clock(Arc::new(TestClock::at(0)));
+                let mut request = get("https://example.com/conditional").with_arg(
+                    "headers",
+                    ArgRef::Inline(b"If-None-Match: \"abc\"".to_vec()),
+                );
+                if let Some(age) = max_age {
+                    request = request.with_arg("max_age", ArgRef::Inline(age.as_bytes().to_vec()));
+                }
+                for _ in 0..2 {
+                    let repr = futures::executor::block_on(
+                        kernel.issue(request.clone(), &Capability::root()),
+                    )
+                    .unwrap();
+                    if status == 304 {
+                        assert_eq!(
+                            repr.repr_type.params.get("http-status").map(String::as_str),
+                            Some("304"),
+                            "304 must be distinguishable from an empty success"
+                        );
+                        assert!(repr.bytes.is_empty());
+                        assert_eq!(repr.expiry, ikigai_core::Expiry::Always);
+                    } else {
+                        assert_eq!(repr.bytes, b"content");
+                        assert!(!repr.repr_type.params.contains_key("http-status"));
+                    }
+                }
+                assert_eq!(
+                    transport.sends.load(Ordering::SeqCst),
+                    if status == 304 { 2 } else { 1 },
+                    "304 must reach the origin again; 200 retains normal caching"
+                );
+            }
+        }
     }
 
     #[test]
