@@ -254,7 +254,10 @@
 //! deadline the kernel's injected [`Clock`](ikigai_core::Clock) enforces. The freshness window is the
 //! caller's `max_age=` directive (seconds) when given — so a liveness/existence
 //! check can cache a HEAD that carries no freshness of its own — else the response's
-//! `Cache-Control: max-age`; an explicit `no-store`/`no-cache` forbids caching
+//! `Cache-Control: max-age`, then `Expires`, then 10% of the age since
+//! `Last-Modified` (capped at one day). Dates are relative to the response's `Date`
+//! or the kernel clock. Invalid or past `Expires` is stale; an explicit
+//! `no-store`/`no-cache` forbids caching
 //! either way. With no window (or no clock) a web read stays uncacheable, a live
 //! fact. v1 is **lazy**: validity is checked on read; there is no proactive harvest
 //! thread (deferred).
@@ -1225,7 +1228,8 @@ fn with_freshness(
 }
 
 /// The freshness window (seconds) for a cacheable read: the **caller's** `max_age` arg if given,
-/// else the response's `Cache-Control: max-age` — but an explicit `no-store`/`no-cache` forbids
+/// else `Cache-Control: max-age`, `Expires`, or a capped Last-Modified heuristic.
+/// An explicit `no-store`/`no-cache` forbids
 /// caching regardless (a strong origin directive wins over a caller's staleness tolerance). The
 /// caller directive is what lets a liveness/existence check cache a HEAD that carries no freshness
 /// of its own, instead of hitting the network every time.
@@ -1233,7 +1237,38 @@ fn freshness_window(response: &HttpResponse, inv: &Invocation<'_>) -> Option<u64
     if response_forbids_store(response) {
         return None;
     }
-    caller_max_age(inv).or_else(|| response_max_age(response))
+    caller_max_age(inv)
+        .or_else(|| response_max_age(response))
+        .or_else(|| response_date_freshness(response, inv))
+        .filter(|seconds| *seconds > 0)
+}
+
+/// RFC 9111 §4.2.1–4.2.2: explicit expiration takes precedence over heuristics,
+/// including when Expires is invalid or already stale. Use the injected clock
+/// only when the origin supplies no usable Date; never read the host wall clock.
+fn response_date_freshness(response: &HttpResponse, inv: &Invocation<'_>) -> Option<u64> {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let date = response
+        .header("date")
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .or_else(|| UNIX_EPOCH.checked_add(Duration::from_millis(inv.now()?.as_millis())))?;
+    if let Some(expires) = response.header("expires") {
+        return Some(
+            httpdate::parse_http_date(expires)
+                .ok()
+                .and_then(|expires| expires.duration_since(date).ok())
+                .map_or(0, |duration| duration.as_secs()),
+        );
+    }
+    let modified = httpdate::parse_http_date(response.header("last-modified")?).ok()?;
+    Some(
+        date.duration_since(modified)
+            .ok()?
+            .as_secs()
+            .saturating_div(10)
+            .min(86_400),
+    )
 }
 
 /// The caller's `max_age` directive in seconds, if provided and parseable.
@@ -1610,6 +1645,183 @@ mod tests {
                     "304 must reach the origin again; 200 retains normal caching"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn date_freshness_over_mock_transport() {
+        const DATE: &str = "Wed, 28 Oct 2026 12:00:00 GMT";
+        const EXPIRES: &str = "Wed, 28 Oct 2026 14:00:00 GMT";
+        const OLD: &str = "Sun, 18 Oct 2026 12:00:00 GMT";
+        const HOUR: &str = "Wed, 28 Oct 2026 11:00:00 GMT";
+        let now = 1_793_188_800_000;
+        let cases = [
+            (
+                "date_beats_clock",
+                vec![("Date", HOUR), ("Expires", EXPIRES)],
+                None,
+                Some(10800),
+            ),
+            (
+                "invalid_date_uses_clock",
+                vec![("Date", "invalid"), ("Expires", EXPIRES)],
+                None,
+                Some(7200),
+            ),
+            (
+                "expires_now",
+                vec![("Date", DATE), ("Expires", DATE), ("Last-Modified", OLD)],
+                None,
+                None,
+            ),
+            (
+                "expires",
+                vec![("Date", DATE), ("Expires", EXPIRES)],
+                None,
+                Some(7200),
+            ),
+            (
+                "expires_clock",
+                vec![("Expires", EXPIRES)],
+                None,
+                Some(7200),
+            ),
+            (
+                "past_expires",
+                vec![("Date", DATE), ("Expires", OLD), ("Last-Modified", OLD)],
+                None,
+                None,
+            ),
+            (
+                "bad_expires",
+                vec![
+                    ("Date", DATE),
+                    ("Expires", "invalid"),
+                    ("Last-Modified", OLD),
+                ],
+                None,
+                None,
+            ),
+            (
+                "capped_heuristic",
+                vec![("Date", DATE), ("Last-Modified", OLD)],
+                None,
+                Some(86400),
+            ),
+            (
+                "short_heuristic",
+                vec![("Date", DATE), ("Last-Modified", HOUR)],
+                None,
+                Some(360),
+            ),
+            (
+                "heuristic_clock",
+                vec![("Last-Modified", HOUR)],
+                None,
+                Some(360),
+            ),
+            (
+                "future_modified",
+                vec![("Date", DATE), ("Last-Modified", EXPIRES)],
+                None,
+                None,
+            ),
+            (
+                "bad_modified",
+                vec![("Last-Modified", "invalid")],
+                None,
+                None,
+            ),
+            (
+                "max_age",
+                vec![
+                    ("Date", DATE),
+                    ("Expires", EXPIRES),
+                    ("Cache-Control", "max-age=60"),
+                ],
+                None,
+                Some(60),
+            ),
+            (
+                "caller",
+                vec![
+                    ("Date", DATE),
+                    ("Expires", EXPIRES),
+                    ("Cache-Control", "max-age=60"),
+                ],
+                Some("30"),
+                Some(30),
+            ),
+            (
+                "no_store",
+                vec![
+                    ("Date", DATE),
+                    ("Expires", EXPIRES),
+                    ("Last-Modified", OLD),
+                    ("Cache-Control", "no-store, max-age=60"),
+                ],
+                Some("30"),
+                None,
+            ),
+            (
+                "no_cache",
+                vec![
+                    ("Date", DATE),
+                    ("Expires", EXPIRES),
+                    ("Cache-Control", "no-cache"),
+                ],
+                Some("30"),
+                None,
+            ),
+            (
+                "zero_max_age",
+                vec![
+                    ("Date", DATE),
+                    ("Expires", EXPIRES),
+                    ("Cache-Control", "max-age=0, must-revalidate"),
+                ],
+                None,
+                None,
+            ),
+            ("no_freshness", vec![], None, None),
+        ];
+        for (name, headers, caller, seconds) in cases {
+            let mut response = resp(None);
+            response
+                .headers
+                .extend(headers.into_iter().map(|(k, v)| (k.into(), v.into())));
+            let transport = Arc::new(Mock::new(response));
+            let clock = TestClock::at(now);
+            let kernel =
+                Kernel::new(Arc::new(space(transport.clone()))).with_clock(Arc::new(clock.clone()));
+            let mut request = get("https://example.com/freshness");
+            if let Some(age) = caller {
+                request = request.with_arg("max_age", ArgRef::Inline(age.as_bytes().to_vec()));
+            }
+            let issue = || {
+                futures::executor::block_on(kernel.issue(request.clone(), &Capability::root()))
+                    .unwrap()
+            };
+            let repr = issue();
+            if let Some(seconds) = seconds {
+                let expected = Representation::new(ReprType::new("text/plain"), vec![])
+                    .cacheable_until(Time::from_millis(now + seconds * 1000));
+                assert_eq!(repr.expiry, expected.expiry, "{name}");
+                clock.set(now + seconds * 1000 - 1);
+                issue();
+                assert_eq!(transport.gets(), 1, "{name}: cached before deadline");
+                clock.set(now + seconds * 1000 + 1);
+                issue();
+                assert_eq!(transport.gets(), 2, "{name}: refetched after deadline");
+            } else {
+                assert_eq!(repr.expiry, ikigai_core::Expiry::Always, "{name}");
+                issue();
+                assert_eq!(transport.gets(), 2, "{name}: must stay live");
+            }
+            let clockless = Kernel::new(Arc::new(space(transport.clone())));
+            let repr =
+                futures::executor::block_on(clockless.issue(request, &Capability::root())).unwrap();
+            assert_eq!(repr.expiry, ikigai_core::Expiry::Always, "{name}: no clock");
         }
     }
 

@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.4.3
+
+### Fixed: honor origin date freshness (ledger #2533)
+
+GET/HEAD now use `Expires` when neither the caller's `max_age` nor the
+response's `max-age` supplies a lifetime. Invalid or past `Expires` stays stale.
+Without either explicit origin lifetime, `Last-Modified` supplies a heuristic
+of 10% of its age, capped at one day. The response's `Date` (or the injected
+kernel clock) anchors both calculations. `no-store` and `no-cache` still forbid
+caching; zero lifetimes stay live. Responses without freshness remain uncacheable;
+conditional revalidation is deferred.
 
 ### Fixed: distinguish 304 Not Modified (ledger #2531)
 

@@ -99,7 +99,7 @@
 //!   capability does not grant. The hop dies at the ACL, typed `Denied`, one
 //!   connection. `/hop-in` redirects within the grant and is followed.
 //! - **What the code does with freshness today**
-//!   ([`a_get_is_live_unless_the_response_says_otherwise`]): no `Cache-Control` →
+//!   ([`a_get_is_live_unless_the_response_says_otherwise`]): no freshness headers →
 //!   live; `max-age` → cached until the deadline; `no-store` → live; a caller's
 //!   `max_age=` → cached; an `ETag` alone → live (no conditional revalidation
 //!   exists — pinned as what the code does, not designed here); `max-age` on a
