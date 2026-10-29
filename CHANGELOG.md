@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed: distinguish 304 Not Modified (ledger #2531)
+
+A 304 now returns an empty representation with `http-status=304` in its type
+parameters, always uncacheable regardless of origin or caller freshness. It
+never serves or caches the URL's content, reads the response body, or cuts a
+mutation thread. Ordinary 200 responses retain their existing behavior.
+
 ## 0.4.2
 
 ### Security: strip credentials on cross-origin redirects (ledger #2459)

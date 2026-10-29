@@ -10,7 +10,7 @@
 //!
 //! | origin status | [`Error`] | class |
 //! | --- | --- | --- |
-//! | 2xx, 3xx | none: a success | |
+//! | 2xx, 3xx | none: not an error (304 is metadata-only at the endpoint) | |
 //! | 404, 410 | [`NotFound`](Error::NotFound) | permanent |
 //! | 401, 403 | [`Refused`](Error::Refused) | refused |
 //! | 408, 504 | [`Timeout`](Error::Timeout) | transient |
@@ -86,7 +86,8 @@ use ikigai_core::{Error, Time};
 use crate::HttpResponse;
 
 /// The [`Error`] for an origin's answer with `status`, or `None` for a success (2xx, or a
-/// 3xx the caller did not follow). `retry_after` is the delay the answer carried, already
+/// 3xx the caller did not follow). This classifies errors only: a 304 is not content.
+/// The HTTP endpoints return it as uncacheable metadata (`http-status=304`). `retry_after` is the delay the answer carried, already
 /// parsed (see [`retry_after`]); it is read only for 429 and 503. `detail` becomes the
 /// error's message; for a 429 it is prefixed `rate-limited: `, since a 429 is a rate
 /// limit whatever the caller called it. See the [module docs](self) for the table.

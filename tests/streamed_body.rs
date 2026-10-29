@@ -208,6 +208,32 @@ fn head_errors_and_refused_redirects_drop_bodies_without_reading() {
 }
 
 #[test]
+fn not_modified_is_metadata_only_and_drops_the_body_unread() {
+    for method in Method::ALL {
+        let (body, observed) = body(100);
+        let repr = invoke(
+            method,
+            HttpResponse {
+                status: 304,
+                headers: vec![("Cache-Control".into(), "max-age=600".into())],
+                body,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            repr.repr_type.params.get("http-status").map(String::as_str),
+            Some("304")
+        );
+        assert!(repr.bytes.is_empty());
+        assert_eq!(repr.expiry, ikigai_core::Expiry::Always);
+        assert!(repr.threads().is_empty());
+        assert_eq!(read_count(&observed), 0);
+        assert_dropped(&observed);
+    }
+}
+
+#[test]
 fn buffered_bodies_obey_the_same_limit() {
     assert_eq!(
         block_on(HttpBody::from(vec![1, 2]).collect(2)).unwrap(),

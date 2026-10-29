@@ -232,13 +232,19 @@
 //! ```
 //! - `HEAD`/`exists`: a `"true"`/`"false"` text representation, following the `ikigai-fs` `Exists`
 //!   convention (existence is an answer, not an error). Existence is **lenient**: the check is only
-//!   reached once the server has answered, so any status but 404/410 means the host is reachable and
+//!   reached once the server has answered, so any status but 304/404/410 means the host is reachable and
 //!   the endpoint is *present* (`true`) — a 429 throttle, a 5xx error, a 408/504 timeout all count
 //!   as there-but-busy. Only 404/410 is *absent* (`false`); only a transport failure (which errors
 //!   before the status is seen) is unreachable. This is deliberately more lenient than `Source`:
 //!   `Exists` asks "is it there?", `Source` asks "give it to me" (where a 429/5xx is an honest
 //!   transient error). A link-checker leans on the split — a bookmark whose host answers `429`/`503`
 //!   is not dead.
+//!
+//! A `304 Not Modified` is the exception on every method: an empty representation
+//! with `repr_type.params["http-status"] = "304"`, always uncacheable even with
+//! origin or caller freshness. Its body is dropped unread and no mutation thread
+//! is cut. A caller sending validators must inspect this metadata and reuse its
+//! own saved content; the endpoint does not revalidate automatically.
 //!
 //! ## Caching (needs `ikigai-core` ≥ 0.1.12)
 //!
@@ -857,6 +863,21 @@ impl Endpoint for HttpEndpoint {
             }
         };
 
+        // A 304 carries no content to serve or cache. Preserve the status in the
+        // representation type and return before freshness or mutation handling,
+        // even when the caller supplied max_age. Drop the transport body unread.
+        if response.status == 304 {
+            let repr_type = if self.method == Method::Head {
+                ReprType::new("text/plain")
+            } else {
+                content_type(&response)
+            };
+            return Ok(Representation::new(
+                repr_type.with_param("http-status", "304"),
+                Vec::new(),
+            ));
+        }
+
         // HEAD answers *existence*, per the `ikigai-fs` convention: a `"true"`/`"false"` text
         // representation for a definitive presence answer, a typed error when the status doesn't
         // speak to presence. No opinion about what's "dead" — the caller reads the honest signal.
@@ -915,7 +936,8 @@ impl Endpoint for HttpEndpoint {
     fn describe(&self) -> Description {
         let summary = if self.method == Method::Head {
             "Ask whether a URL is present (`true`/`false`) with an HTTP HEAD through a host \
-             transport, capability-gated by `urn:cap:net`."
+             transport, capability-gated by `urn:cap:net`; a 304 is an empty, uncacheable \
+             result with `http-status=304` type metadata."
         } else if self.method == Method::Propfind {
             "Send a WebDAV PROPFIND (RFC 4918) to a URL through a host transport, \
              capability-gated by `urn:cap:net`: `content` is the XML request, `Depth` goes in \
