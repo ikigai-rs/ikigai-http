@@ -68,6 +68,12 @@
 //!   handed the SAME `Arc` the kernel walks ([`http_space`]), and holds it to
 //!   `id() == None` and an anonymous topology root.
 //!   [`a_self_named_http_space_goes_red`] shows the declaration is load-bearing.
+//! - **`BODIES` receives the same shared space as the kernel**. HTTP GET is
+//!   volatile: `/live` is declared live, and `/fresh` expires at a deadline, so
+//!   the suite correctly leaves method agreement unprobed for both fixtures.
+//!   [`assert_shape`] permits only that specific unprobed result; missing wiring
+//!   or any other coverage gap fails. `BODY-INPUTS` has no candidates: the module
+//!   consumes inline arguments and declares no `reads_body` inputs.
 //! - **`REQUIRED` covers the six `Sink`/`Delete` actions too** (`Suite::required_on_mutating`,
 //!   0.8.0). `url` is the one required input on all eight actions, and dropping it
 //!   must be refused with a typed `MissingArgument` before any socket opens: the
@@ -493,7 +499,7 @@ impl Clock for Fixed {
 }
 
 /// The module's space over the loopback client, built once so the kernel and the
-/// suite's `host_named_space` declaration hold the SAME instance.
+/// suite's `host_named_space` and `body_space` declarations hold the SAME instance.
 fn http_space() -> Arc<Alias> {
     Arc::new(ikigai_http::space(Arc::new(Client)))
 }
@@ -522,6 +528,7 @@ fn suite(origin: &Origin, path: &str, space: &Arc<Alias>) -> Suite {
     let mut suite = Suite::new()
         .checks(Checks::all())
         .required_on_mutating()
+        .body_space(space.clone())
         .host_named_space(SPACE_LABEL, space.clone());
     for (id, _, verb) in METHODS {
         suite = suite.fixture(Fixture::new(id, verb).arg("url", origin.url(path)));
@@ -542,7 +549,7 @@ fn assert_shape(report: &Report) {
     assert_eq!(report.actions, METHODS.len(), "one action each: {report}");
     assert!(
         report.checks.skipped().next().is_none(),
-        "all checks run, including DATATYPES and FAILURES: {report}"
+        "all checks run, including BODIES and BODY-INPUTS: {report}"
     );
     assert!(
         report.declared.opted_out.is_empty(),
@@ -576,15 +583,20 @@ fn assert_shape(report: &Report) {
         "the one space constructor is declared, host-named: {report}"
     );
     assert!(report.declared.required_on_mutating, "{report}");
-    let unobserved: Vec<&str> = report
+    let unprobed: Vec<(&str, Verb, Check, &str)> = report
         .unprobed
         .iter()
-        .filter(|u| u.check == Check::Required)
-        .map(|u| u.endpoint.as_str())
+        .map(|u| (u.endpoint.as_str(), u.verb, u.check, u.reason.as_str()))
         .collect();
-    assert!(
-        unobserved.is_empty(),
-        "REQUIRED observed a dropped `url` on every verb, none left unprobed: {report}"
+    assert_eq!(
+        unprobed,
+        [(
+            "http-get",
+            Verb::Source,
+            Check::Bodies,
+            "uncacheable, time-varying, or volatile answer: independent calls cannot establish method agreement (Suite::live, expiry or CACHEABLE's byte comparison)",
+        )],
+        "only volatile GET may remain unprobed; deterministic checks must run: {report}"
     );
 }
 
