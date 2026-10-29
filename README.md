@@ -122,19 +122,29 @@ cuts that thread and recomputes it. Its freshness lifetime comes from the caller
 `max_age=` (seconds), then `Cache-Control: max-age`, then `Expires`, then 10% of
 the age since `Last-Modified` (capped at one day). Date calculations use the
 response's `Date` or the injected kernel clock. Invalid or past `Expires` is
-already stale. `no-store` and `no-cache` forbid caching even with a caller
-lifetime. Zero lifetimes, no freshness signal, or no kernel clock keep reads
-live (uncacheable). The kernel enforces each cache deadline.
+already stale. `no-store` forbids caching even with a caller lifetime.
+`no-cache` and `max-age=0, must-revalidate` force a zero lifetime; validator-only
+responses also receive a zero lifetime. Without a kernel clock reads stay
+uncacheable. RSS `<ttl>` is left to compositions.
 
 ### Conditional requests: 304 Not Modified
 
-When an origin answers `304`, every endpoint returns an empty representation
-with `repr_type.params["http-status"] = "304"`. This is a distinct status result,
-not the URL's content. It is always uncacheable, even with response `max-age` or
-a caller `max_age`, and its body is dropped unread. HEAD uses `text/plain` for
-this result; other methods use the origin's content type or the usual fallback.
-Callers sending validators through `headers=` must inspect this metadata and
-reuse their own saved content. The module does not revalidate automatically.
+GET/HEAD answers preserve `ETag` and/or `Last-Modified`. When core offers an
+expired answer, the endpoint sends `If-None-Match` and/or `If-Modified-Since`.
+A 304 serves the stored body without reading the transport body, using the
+304's own freshness headers (the same rules as a 200). A 200 replaces the body
+and validators. URL mutation invalidation still applies after revalidation.
+
+Without an endpoint-generated condition for a stale offer, a 304 remains an
+empty, uncacheable representation with `repr_type.params["http-status"] = "304"`.
+HEAD uses `text/plain`; other methods use the origin's content type or fallback.
+Callers sending their own validators through `headers=` must inspect this metadata
+and reuse their own content.
+
+Validator-only and zero-lifetime responses are stored for revalidation (core
+0.2.7 keeps an answer that arrives already expired when it carries a
+validator): every read sends a conditional request, and a 304 serves the
+stored body. Positive-lifetime responses revalidate after their deadline.
 
 ## Host transport
 

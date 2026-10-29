@@ -240,34 +240,39 @@
 //!   transient error). A link-checker leans on the split — a bookmark whose host answers `429`/`503`
 //!   is not dead.
 //!
-//! A `304 Not Modified` is the exception on every method: an empty representation
-//! with `repr_type.params["http-status"] = "304"`, always uncacheable even with
-//! origin or caller freshness. Its body is dropped unread and no mutation thread
-//! is cut. A caller sending validators must inspect this metadata and reuse its
-//! own saved content; the endpoint does not revalidate automatically.
+//! A `304 Not Modified` answers an endpoint-generated conditional GET/HEAD by
+//! serving core's stored body under the 304's own freshness deadline. Its transport
+//! body is dropped unread. Without such a condition it remains an empty,
+//! uncacheable result with `repr_type.params["http-status"] = "304"`; callers
+//! sending their own validators must inspect that metadata and reuse their content.
 //!
-//! ## Caching (needs `ikigai-core` ≥ 0.1.12)
+//! ## Caching (needs `ikigai-core` ≥ 0.2.6)
 //!
-//! A cacheable `GET`/`HEAD` is threaded on its URL (so a later `sink`/`delete` to
-//! the same URL cuts that thread and recomputes it — the write-invalidates-read
-//! half of the golden thread, applied to the web) and marked [`cacheable_until`](ikigai_core::Representation::cacheable_until) a
-//! deadline the kernel's injected [`Clock`](ikigai_core::Clock) enforces. The freshness window is the
-//! caller's `max_age=` directive (seconds) when given — so a liveness/existence
-//! check can cache a HEAD that carries no freshness of its own — else the response's
-//! `Cache-Control: max-age`, then `Expires`, then 10% of the age since
-//! `Last-Modified` (capped at one day). Dates are relative to the response's `Date`
-//! or the kernel clock. Invalid or past `Expires` is stale; an explicit
-//! `no-store`/`no-cache` forbids caching
-//! either way. With no window (or no clock) a web read stays uncacheable, a live
-//! fact. v1 is **lazy**: validity is checked on read; there is no proactive harvest
-//! thread (deferred).
+//! GET/HEAD answers carry the origin's `ETag` and/or `Last-Modified`. A stale
+//! offer from core sends `If-None-Match` and/or `If-Modified-Since`; a 200 replaces
+//! the representation. Cached answers depend on the URL's golden thread, so a
+//! successful mutation invalidates them, including after revalidation.
+//!
+//! Freshness comes from the caller's `max_age=`, then `Cache-Control: max-age`,
+//! then `Expires`, then 10% of the age since `Last-Modified` (capped at one day).
+//! Dates use the response's `Date` or the injected kernel clock. `no-store`
+//! forbids storage; `no-cache` and `max-age=0, must-revalidate` override the caller
+//! with a zero lifetime. Validator-only answers also receive a zero lifetime.
+//! Without a kernel clock reads stay uncacheable. RSS ttl is not an HTTP policy.
+//!
+//! Since core 0.2.7 an answer that arrives already expired but carries an origin
+//! validator is stored, never served as fresh, and offered for revalidation on the
+//! next read, so zero-lifetime and validator-only answers revalidate on every read
+//! and a 304 keeps the stored body. Positive-lifetime answers revalidate after
+//! expiration.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
     Alias, AliasTable, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact,
-    FailureClass, Invocation, Iri, ReprType, Representation, Request, Result, Verb,
+    FailureClass, Invocation, Iri, OriginValidator, ReprType, Representation, Request, Result,
+    Verb,
 };
 use url::Url;
 
@@ -782,6 +787,23 @@ impl Endpoint for HttpEndpoint {
         };
         let mut headers = request_headers(inv);
 
+        // Only an endpoint-generated condition can validate the offered body.
+        let conditional = self.method.is_cacheable()
+            && inv.stale().is_some_and(|stale| {
+                let validator = &stale.validator;
+                headers.retain(|(name, _)| {
+                    !name.eq_ignore_ascii_case("If-None-Match")
+                        && !name.eq_ignore_ascii_case("If-Modified-Since")
+                });
+                if let Some(etag) = &validator.etag {
+                    headers.push(("If-None-Match".into(), etag.clone()));
+                }
+                if let Some(modified) = &validator.last_modified {
+                    headers.push(("If-Modified-Since".into(), modified.clone()));
+                }
+                validator.etag.is_some() || validator.last_modified.is_some()
+            });
+
         // Follow redirects here — never in the transport — so the capability ACL
         // runs against EVERY hop's authority, not just the first (the transport
         // contract forbids auto-following for exactly this reason).
@@ -866,6 +888,32 @@ impl Endpoint for HttpEndpoint {
             }
         };
 
+        if response.status == 304 && conditional {
+            // The body stays in core's cache; drop the transport body unread.
+            let now = inv.now().expect("a stale offer has a kernel clock");
+            let window = freshness_window(&response, inv);
+            let mut repr = Representation::revalidated(
+                now.plus_millis(window.unwrap_or(0).saturating_mul(1000)),
+            );
+            if response_forbids_store(&response) {
+                repr = repr.with_expiry(ikigai_core::Expiry::Always);
+            }
+            // A 304 may update just one member of the validator pair.
+            let mut validator = inv
+                .stale()
+                .expect("conditional stale offer")
+                .validator
+                .clone();
+            let updated = response_validator(&response);
+            if updated.etag.is_some() {
+                validator.etag = updated.etag;
+            }
+            if updated.last_modified.is_some() {
+                validator.last_modified = updated.last_modified;
+            }
+            return Ok(repr.validated_by(validator));
+        }
+
         // A 304 carries no content to serve or cache. Preserve the status in the
         // representation type and return before freshness or mutation handling,
         // even when the caller supplied max_age. Drop the transport body unread.
@@ -895,7 +943,12 @@ impl Endpoint for HttpEndpoint {
                     b"false".to_vec()
                 },
             );
-            return Ok(with_freshness(repr, window, inv, &thread));
+            return Ok(with_freshness(
+                with_validator(repr, response_validator(&response)),
+                window,
+                inv,
+                &thread,
+            ));
         }
 
         // Every other method returns a representation on success and a **typed error** on a
@@ -919,10 +972,16 @@ impl Endpoint for HttpEndpoint {
 
         let window = freshness_window(&response, inv);
         let repr_type = content_type(&response);
+        let validator = response_validator(&response);
         let bytes = response.body.collect(self.max_response_bytes).await?;
         let repr = Representation::new(repr_type, bytes);
         if self.method.is_cacheable() {
-            return Ok(with_freshness(repr, window, inv, &thread));
+            return Ok(with_freshness(
+                with_validator(repr, validator),
+                window,
+                inv,
+                &thread,
+            ));
         }
         Ok(repr)
     }
@@ -939,8 +998,8 @@ impl Endpoint for HttpEndpoint {
     fn describe(&self) -> Description {
         let summary = if self.method == Method::Head {
             "Ask whether a URL is present (`true`/`false`) with an HTTP HEAD through a host \
-             transport, capability-gated by `urn:cap:net`; a 304 is an empty, uncacheable \
-             result with `http-status=304` type metadata."
+             transport, capability-gated by `urn:cap:net`; an unsolicited 304 is an empty, \
+             uncacheable result with `http-status=304` type metadata."
         } else if self.method == Method::Propfind {
             "Send a WebDAV PROPFIND (RFC 4918) to a URL through a host transport, \
              capability-gated by `urn:cap:net`: `content` is the XML request, `Depth` goes in \
@@ -1229,18 +1288,26 @@ fn with_freshness(
 
 /// The freshness window (seconds) for a cacheable read: the **caller's** `max_age` arg if given,
 /// else `Cache-Control: max-age`, `Expires`, or a capped Last-Modified heuristic.
-/// An explicit `no-store`/`no-cache` forbids
-/// caching regardless (a strong origin directive wins over a caller's staleness tolerance). The
+/// `no-store` forbids storage; `no-cache` and `max-age=0, must-revalidate` force
+/// a zero lifetime regardless of the caller's staleness tolerance. The
 /// caller directive is what lets a liveness/existence check cache a HEAD that carries no freshness
 /// of its own, instead of hitting the network every time.
 fn freshness_window(response: &HttpResponse, inv: &Invocation<'_>) -> Option<u64> {
     if response_forbids_store(response) {
         return None;
     }
+    if cache_directive(response, "no-cache")
+        || (cache_directive(response, "must-revalidate") && response_max_age(response) == Some(0))
+    {
+        return Some(0);
+    }
     caller_max_age(inv)
         .or_else(|| response_max_age(response))
         .or_else(|| response_date_freshness(response, inv))
-        .filter(|seconds| *seconds > 0)
+        .or_else(|| {
+            let validator = response_validator(response);
+            (validator.etag.is_some() || validator.last_modified.is_some()).then_some(0)
+        })
 }
 
 /// RFC 9111 §4.2.1–4.2.2: explicit expiration takes precedence over heuristics,
@@ -1278,12 +1345,37 @@ fn caller_max_age(inv: &Invocation<'_>) -> Option<u64> {
         .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
-/// Whether the response forbids caching outright (`Cache-Control: no-store` / `no-cache`).
-fn response_forbids_store(response: &HttpResponse) -> bool {
+fn with_validator(repr: Representation, validator: OriginValidator) -> Representation {
+    if validator.etag.is_some() || validator.last_modified.is_some() {
+        repr.validated_by(validator)
+    } else {
+        repr
+    }
+}
+
+/// HTTP validators are opaque origin values, including weak tags and date spelling.
+fn response_validator(response: &HttpResponse) -> OriginValidator {
+    OriginValidator {
+        etag: response.header("etag").map(str::to_owned),
+        last_modified: response.header("last-modified").map(str::to_owned),
+    }
+}
+
+fn cache_directive(response: &HttpResponse, name: &str) -> bool {
     response.header("cache-control").is_some_and(|cc| {
-        let cc = cc.to_ascii_lowercase();
-        cc.contains("no-store") || cc.contains("no-cache")
+        cc.split(',').any(|directive| {
+            directive
+                .trim()
+                .split('=')
+                .next()
+                .is_some_and(|key| key.trim().eq_ignore_ascii_case(name))
+        })
     })
+}
+
+/// Only no-store forbids retaining the response for revalidation.
+fn response_forbids_store(response: &HttpResponse) -> bool {
+    cache_directive(response, "no-store")
 }
 
 /// The response's own freshness window from `Cache-Control: max-age=N`, if present.
@@ -1672,7 +1764,7 @@ mod tests {
                 "expires_now",
                 vec![("Date", DATE), ("Expires", DATE), ("Last-Modified", OLD)],
                 None,
-                None,
+                Some(0),
             ),
             (
                 "expires",
@@ -1690,7 +1782,7 @@ mod tests {
                 "past_expires",
                 vec![("Date", DATE), ("Expires", OLD), ("Last-Modified", OLD)],
                 None,
-                None,
+                Some(0),
             ),
             (
                 "bad_expires",
@@ -1700,7 +1792,7 @@ mod tests {
                     ("Last-Modified", OLD),
                 ],
                 None,
-                None,
+                Some(0),
             ),
             (
                 "capped_heuristic",
@@ -1724,13 +1816,13 @@ mod tests {
                 "future_modified",
                 vec![("Date", DATE), ("Last-Modified", EXPIRES)],
                 None,
-                None,
+                Some(0),
             ),
             (
                 "bad_modified",
                 vec![("Last-Modified", "invalid")],
                 None,
-                None,
+                Some(0),
             ),
             (
                 "max_age",
@@ -1771,7 +1863,7 @@ mod tests {
                     ("Cache-Control", "no-cache"),
                 ],
                 Some("30"),
-                None,
+                Some(0),
             ),
             (
                 "zero_max_age",
@@ -1781,7 +1873,7 @@ mod tests {
                     ("Cache-Control", "max-age=0, must-revalidate"),
                 ],
                 None,
-                None,
+                Some(0),
             ),
             ("no_freshness", vec![], None, None),
         ];
@@ -1807,9 +1899,11 @@ mod tests {
                 let expected = Representation::new(ReprType::new("text/plain"), vec![])
                     .cacheable_until(Time::from_millis(now + seconds * 1000));
                 assert_eq!(repr.expiry, expected.expiry, "{name}");
-                clock.set(now + seconds * 1000 - 1);
-                issue();
-                assert_eq!(transport.gets(), 1, "{name}: cached before deadline");
+                if seconds > 0 {
+                    clock.set(now + seconds * 1000 - 1);
+                    issue();
+                    assert_eq!(transport.gets(), 1, "{name}: cached before deadline");
+                }
                 clock.set(now + seconds * 1000 + 1);
                 issue();
                 assert_eq!(transport.gets(), 2, "{name}: refetched after deadline");
@@ -2385,6 +2479,301 @@ mod tests {
                 clone_buffered_response(&scripted[0])
             })
         }
+    }
+
+    #[test]
+    fn validator_only_response_revalidates_and_serves_stored_body() {
+        let mut initial = ok_body("stored body");
+        initial.headers.push(("ETag".into(), "W/\"v1\"".into()));
+        let mut unchanged = ok_body("must not be served");
+        unchanged.status = 304;
+        unchanged
+            .headers
+            .push(("Cache-Control".into(), "max-age=60".into()));
+        let transport = Seq::new(vec![initial, unchanged]);
+        let clock = TestClock::at(1000);
+        let kernel =
+            Kernel::new(Arc::new(space(transport.clone()))).with_clock(Arc::new(clock.clone()));
+        let issue = || {
+            futures::executor::block_on(
+                kernel.issue(get("https://example.com/revalidate"), &Capability::root()),
+            )
+            .unwrap()
+        };
+        assert_eq!(issue().bytes, b"stored body");
+        clock.set(1001);
+        assert_eq!(issue().bytes, b"stored body");
+        assert_eq!(
+            transport.urls().len(),
+            2,
+            "one transport call for revalidation"
+        );
+        assert!(transport.headers.lock().unwrap()[1]
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("If-None-Match") && v == "W/\"v1\""));
+        clock.set(2000);
+        assert_eq!(issue().bytes, b"stored body");
+        assert_eq!(transport.urls().len(), 2, "304's freshness is used");
+    }
+
+    struct UnreadBody;
+    impl futures_io::AsyncRead for UnreadBody {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            panic!("304 body must never be read")
+        }
+    }
+
+    fn response_with(status: u16, headers: &[(&str, &str)], body: &str) -> HttpResponse {
+        let mut response = ok_body(body);
+        response.status = status;
+        response
+            .headers
+            .extend(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        response
+    }
+
+    #[test]
+    fn expired_get_and_head_revalidate_with_each_origin_validator_and_replace_on_200() {
+        const MODIFIED: &str = "Wed, 28 Oct 2026 12:00:00 GMT";
+        for method in [Method::Get, Method::Head] {
+            for validators in [
+                vec![("ETag", "W/\"v1\"")],
+                vec![("Last-Modified", MODIFIED)],
+                vec![("ETag", "W/\"v1\""), ("Last-Modified", MODIFIED)],
+            ] {
+                let mut headers = validators.clone();
+                headers.push(("Cache-Control", "max-age=1"));
+                let initial = response_with(200, &headers, "old body");
+                let mut unchanged = response_with(304, &[("Cache-Control", "max-age=2")], "");
+                unchanged.body = HttpBody::from_reader(UnreadBody);
+                let replacement = response_with(
+                    200,
+                    &[("ETag", "\"v2\""), ("Cache-Control", "max-age=3")],
+                    "new body",
+                );
+                let transport = Seq::new(vec![initial, unchanged, replacement]);
+                let clock = TestClock::at(1000);
+                let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                    .with_clock(Arc::new(clock.clone()));
+                let request = Request::new(method.verb(), Iri::parse(method.iri()).unwrap())
+                    .with_arg(
+                        "url",
+                        ArgRef::Inline(b"https://example.com/revalidate".to_vec()),
+                    );
+                let issue = || {
+                    futures::executor::block_on(kernel.issue(request.clone(), &Capability::root()))
+                        .unwrap()
+                };
+                let old = issue();
+                assert_eq!(
+                    old.origin_validator().unwrap().etag.as_deref(),
+                    validators
+                        .iter()
+                        .find(|(k, _)| *k == "ETag")
+                        .map(|(_, v)| *v)
+                );
+                clock.set(2001);
+                let refreshed = issue();
+                assert_eq!(refreshed.bytes, old.bytes);
+                assert_eq!(refreshed.repr_type, old.repr_type);
+                assert_eq!(
+                    refreshed.expiry,
+                    ikigai_core::Expiry::At(Time::from_millis(4001))
+                );
+                assert_eq!(refreshed.origin_validator(), old.origin_validator());
+                let sent = transport.headers.lock().unwrap()[1].clone();
+                for (name, value) in &validators {
+                    let condition = if *name == "ETag" {
+                        "If-None-Match"
+                    } else {
+                        "If-Modified-Since"
+                    };
+                    assert!(sent
+                        .iter()
+                        .any(|(k, v)| k.eq_ignore_ascii_case(condition) && v == value));
+                }
+                assert_eq!(
+                    sent.iter().filter(|(k, _)| k.starts_with("If-")).count(),
+                    validators.len()
+                );
+                clock.set(3000);
+                issue();
+                assert_eq!(transport.urls().len(), 2);
+                clock.set(4002);
+                let new = issue();
+                assert_eq!(
+                    new.bytes,
+                    if method == Method::Head {
+                        b"true".as_slice()
+                    } else {
+                        b"new body".as_slice()
+                    }
+                );
+                assert_eq!(
+                    new.origin_validator().unwrap().etag.as_deref(),
+                    Some("\"v2\"")
+                );
+                assert_eq!(new.origin_validator().unwrap().last_modified, None);
+                issue();
+                assert_eq!(transport.urls().len(), 3, "replacement cached");
+            }
+        }
+    }
+
+    #[test]
+    fn revalidation_uses_304_freshness_and_merges_updated_validators() {
+        const DATE: &str = "Wed, 28 Oct 2026 12:00:00 GMT";
+        const OLD: &str = "Wed, 28 Oct 2026 11:00:00 GMT";
+        const LATER: &str = "Wed, 28 Oct 2026 14:00:00 GMT";
+        for (headers, seconds) in [
+            (vec![("Cache-Control", "max-age=60")], Some(60)),
+            (vec![("Date", DATE), ("Expires", LATER)], Some(7200)),
+            (vec![("Date", DATE), ("Last-Modified", OLD)], Some(360)),
+            (vec![("Date", DATE), ("Expires", "invalid")], Some(0)),
+            (vec![("Date", DATE), ("Expires", OLD)], Some(0)),
+            (vec![("Cache-Control", "no-cache, max-age=60")], Some(0)),
+            (vec![("Cache-Control", "no-store, max-age=60")], None),
+            (vec![], Some(0)),
+        ] {
+            let initial = response_with(
+                200,
+                &[("Cache-Control", "max-age=1"), ("ETag", "\"v1\"")],
+                "stored",
+            );
+            let mut unchanged = response_with(304, &headers, "not content");
+            unchanged.headers.push(("ETag".into(), "\"v2\"".into()));
+            let transport = Seq::new(vec![initial, unchanged]);
+            let clock = TestClock::at(1000);
+            let kernel =
+                Kernel::new(Arc::new(space(transport.clone()))).with_clock(Arc::new(clock.clone()));
+            let issue = || {
+                futures::executor::block_on(
+                    kernel.issue(get("https://example.com/dates"), &Capability::root()),
+                )
+                .unwrap()
+            };
+            issue();
+            clock.set(2001);
+            let repr = issue();
+            assert_eq!(repr.bytes, b"stored");
+            assert_eq!(
+                repr.expiry,
+                seconds.map_or(ikigai_core::Expiry::Always, |seconds| {
+                    ikigai_core::Expiry::At(Time::from_millis(2001 + seconds * 1000))
+                })
+            );
+            assert_eq!(
+                repr.origin_validator().unwrap().etag.as_deref(),
+                Some("\"v2\"")
+            );
+        }
+    }
+
+    #[test]
+    fn zero_lifetime_policies_revalidate_on_every_read_even_at_the_same_time() {
+        for policy in ["no-cache, max-age=60", "max-age=0, must-revalidate"] {
+            let initial = response_with(
+                200,
+                &[("ETag", "\"v1\""), ("Cache-Control", policy)],
+                "stored",
+            );
+            let unchanged = response_with(304, &[("Cache-Control", policy)], "not content");
+            let transport = Seq::new(vec![initial, unchanged]);
+            let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                .with_clock(Arc::new(TestClock::at(1000)));
+            let request = get("https://example.com/always")
+                .with_arg("max_age", ArgRef::Inline(b"3600".to_vec()));
+            for _ in 0..3 {
+                let repr =
+                    futures::executor::block_on(kernel.issue(request.clone(), &Capability::root()))
+                        .unwrap();
+                assert_eq!(repr.bytes, b"stored");
+            }
+            let sent = transport.headers.lock().unwrap();
+            assert_eq!(sent.len(), 3);
+            assert!(sent[1..].iter().all(|headers| headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("If-None-Match") && v == "\"v1\"")));
+        }
+    }
+
+    #[test]
+    fn zero_lifetime_directives_override_caller_freshness() {
+        for policy in ["no-cache, max-age=60", "max-age=0, must-revalidate"] {
+            let response = response_with(
+                200,
+                &[("ETag", "\"v1\""), ("Cache-Control", policy)],
+                "content",
+            );
+            let kernel = Kernel::new(Arc::new(space(Seq::new(vec![response]))))
+                .with_clock(Arc::new(TestClock::at(1000)));
+            let repr =
+                futures::executor::block_on(kernel.issue(max_age_get(), &Capability::root()))
+                    .unwrap();
+            assert_eq!(
+                repr.expiry,
+                ikigai_core::Expiry::At(Time::from_millis(1000))
+            );
+            assert_eq!(
+                repr.origin_validator().unwrap().etag.as_deref(),
+                Some("\"v1\"")
+            );
+        }
+    }
+
+    #[test]
+    fn unsolicited_304_after_expiration_remains_a_typed_result() {
+        let initial = response_with(200, &[("Cache-Control", "max-age=1")], "content");
+        let unchanged = response_with(304, &[("Cache-Control", "max-age=60")], "not content");
+        let transport = Seq::new(vec![initial, unchanged]);
+        let clock = TestClock::at(1000);
+        let kernel =
+            Kernel::new(Arc::new(space(transport.clone()))).with_clock(Arc::new(clock.clone()));
+        futures::executor::block_on(
+            kernel.issue(get("https://example.com/status"), &Capability::root()),
+        )
+        .unwrap();
+        clock.set(2001);
+        let repr = futures::executor::block_on(
+            kernel.issue(get("https://example.com/status"), &Capability::root()),
+        )
+        .unwrap();
+        assert!(repr.bytes.is_empty());
+        assert_eq!(repr.expiry, ikigai_core::Expiry::Always);
+        assert_eq!(
+            repr.repr_type.params.get("http-status").map(String::as_str),
+            Some("304")
+        );
+        assert!(!transport.headers.lock().unwrap()[1]
+            .iter()
+            .any(|(k, _)| k.starts_with("If-")));
+    }
+
+    #[test]
+    fn no_store_with_validators_never_makes_a_conditional_request() {
+        let response = response_with(
+            200,
+            &[
+                ("ETag", "\"v1\""),
+                ("Cache-Control", "no-store, max-age=60"),
+            ],
+            "content",
+        );
+        let transport = Seq::new(vec![response]);
+        let kernel = Kernel::new(Arc::new(space(transport.clone())))
+            .with_clock(Arc::new(TestClock::at(1000)));
+        for _ in 0..3 {
+            futures::executor::block_on(kernel.issue(max_age_get(), &Capability::root())).unwrap();
+        }
+        let sent = transport.headers.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|headers| !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("If-None-Match"))));
     }
 
     fn redirect_to(status: u16, location: &str) -> HttpResponse {

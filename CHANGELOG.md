@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+GET/HEAD preserve ETag and Last-Modified and send conditional requests when core
+offers a stale answer. A conditional 304 serves the stored body under its own
+freshness deadline; a 200 replaces it. Unsolicited or caller-conditional 304s
+retain the typed empty result. no-store still forbids storage. The core dependency
+floor is now 0.2.7. No RSS ttl is read.
+
+no-cache and max-age=0, must-revalidate now produce zero deadlines, including
+when the caller supplies max_age. Validator-only responses do too. With core
+0.2.7 (ledger #2553) these are stored for conditional revalidation, so each read
+revalidates and a 304 serves the stored body. The core floor is 0.2.7.
+
 ## 0.4.3
 
 ### Fixed: honor origin date freshness (ledger #2533)
