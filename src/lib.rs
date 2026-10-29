@@ -260,10 +260,11 @@
 //! with a zero lifetime. Validator-only answers also receive a zero lifetime.
 //! Without a kernel clock reads stay uncacheable. RSS ttl is not an HTTP policy.
 //!
-//! **Core 0.2.6 limitation:** core declines entries already expired when returned.
-//! Zero-lifetime answers therefore still refetch unconditionally; storing them
-//! for revalidation on every read requires a core fix. Positive-lifetime answers
-//! revalidate after expiration. See the ignored regression tests for the blocker.
+//! Since core 0.2.7 an answer that arrives already expired but carries an origin
+//! validator is stored, never served as fresh, and offered for revalidation on the
+//! next read, so zero-lifetime and validator-only answers revalidate on every read
+//! and a 304 keeps the stored body. Positive-lifetime answers revalidate after
+//! expiration.
 
 use std::sync::Arc;
 
@@ -2481,7 +2482,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blocked: core 0.2.6 declines entries whose deadline is already reached"]
     fn validator_only_response_revalidates_and_serves_stored_body() {
         let mut initial = ok_body("stored body");
         initial.headers.push(("ETag".into(), "W/\"v1\"".into()));
@@ -2674,7 +2674,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blocked: core 0.2.6 declines entries whose deadline is already reached"]
     fn zero_lifetime_policies_revalidate_on_every_read_even_at_the_same_time() {
         for policy in ["no-cache, max-age=60", "max-age=0, must-revalidate"] {
             let initial = response_with(

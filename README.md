@@ -141,12 +141,10 @@ HEAD uses `text/plain`; other methods use the origin's content type or fallback.
 Callers sending their own validators through `headers=` must inspect this metadata
 and reuse their own content.
 
-**Incomplete on core 0.2.6:** core refuses to store entries already expired on
-arrival. Validator-only and zero-lifetime responses therefore still refetch
-unconditionally, and a zero-lifetime 304 does not retain the body for another
-revalidation. A core fix is required to store these for revalidation on every
-read. Positive-lifetime responses revalidate after their deadline. Two ignored
-regression tests record the missing behavior.
+Validator-only and zero-lifetime responses are stored for revalidation (core
+0.2.7 keeps an answer that arrives already expired when it carries a
+validator): every read sends a conditional request, and a 304 serves the
+stored body. Positive-lifetime responses revalidate after their deadline.
 
 ## Host transport
 

@@ -12,8 +12,9 @@ keywords = ["ikigai", "roc", "resolution", "module", "http"]
 categories = ["web-programming::http-client", "wasm"]
 
 [dependencies]
-# 0.2.6 supplies stale offers, origin validators, and revalidated answers.
-ikigai-core = "0.2.6"
+# 0.2.6 supplies stale offers, origin validators, and revalidated answers; 0.2.7
+# keeps an answer that arrives already expired when it carries a validator.
+ikigai-core = "0.2.7"
 async-trait = "0.1"
 # Runtime-independent AsyncRead for the host response-body seam.
 futures-io = "0.3"
