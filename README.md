@@ -118,9 +118,13 @@ the body is never replayed at an authority the caller did not vet.
 ## Caching (needs `ikigai-core` ≥ 0.1.12)
 
 A cacheable GET/HEAD is threaded on its URL — a later mutating call to the same URL
-cuts that thread and recomputes it — and, when the response carries
-`Cache-Control: max-age`, cached until that deadline (enforced by the kernel's
-injected `Clock`). With no freshness signal a read stays live (uncacheable).
+cuts that thread and recomputes it. Its freshness lifetime comes from the caller's
+`max_age=` (seconds), then `Cache-Control: max-age`, then `Expires`, then 10% of
+the age since `Last-Modified` (capped at one day). Date calculations use the
+response's `Date` or the injected kernel clock. Invalid or past `Expires` is
+already stale. `no-store` and `no-cache` forbid caching even with a caller
+lifetime. Zero lifetimes, no freshness signal, or no kernel clock keep reads
+live (uncacheable). The kernel enforces each cache deadline.
 
 ### Conditional requests: 304 Not Modified
 
