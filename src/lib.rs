@@ -223,6 +223,12 @@
 //! - A transport-level failure is `Timeout` when the transport says it timed out, else
 //!   `Unavailable` ([`status::transport_error`]). Each action declares these classes
 //!   ([`Description::fails`]), so the manifold says what can go wrong before anything does.
+//! - **A failing origin's failure is cached** (ledger #2666): on a cacheable read, a 5xx or a
+//!   429 states a failure expiry (`Invocation::failure_expires_in`) of its `Retry-After`, else
+//!   [`DEFAULT_FAILURE_EXPIRY`]; so does a transport failure. The kernel serves the failure
+//!   until then (clamped to its failure ceiling; a cut on the URL drops it), and a composite
+//!   that catches it stays cacheable until then instead of refetching on every read. A 4xx
+//!   other than 429, and a denial, state nothing.
 //!
 //! ```
 //! use ikigai_core::{Error, FailureClass};
@@ -282,6 +288,15 @@ pub mod body;
 pub mod range;
 pub mod status;
 pub use body::{HttpBody, DEFAULT_MAX_RESPONSE_BYTES};
+
+/// How long a cacheable read's failure is cached when the origin is failing and says
+/// nothing of when to come back (ledger #2666): a 5xx or a 429 with no usable
+/// `Retry-After`, a connection failure, a timeout. One the origin states is used
+/// instead; either way the kernel clamps it to its failure ceiling
+/// (`Kernel::with_failure_ceiling`, five minutes by default) and a cut on the URL's
+/// thread drops it. A 4xx other than 429 and a denial state nothing: they are the
+/// request's fault, not the origin's state, and recompute on every read.
+pub const DEFAULT_FAILURE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The XSD datatypes the inputs declare: the URL is an IRI, a header value is a
 /// string, a freshness window is a count of seconds.
@@ -762,6 +777,23 @@ impl HttpEndpoint {
     }
 }
 
+impl HttpEndpoint {
+    /// The origin is failing (a 5xx, a 429, no answer at all): on a cacheable read, let
+    /// the kernel cache the failure until `retry_after`, else [`DEFAULT_FAILURE_EXPIRY`],
+    /// threaded on the URL so a write to it drops the failure too.
+    fn origin_failing(
+        &self,
+        inv: &Invocation<'_>,
+        thread: &str,
+        retry_after: Option<std::time::Duration>,
+    ) {
+        if self.method.is_cacheable() {
+            inv.depends_on(thread.to_string());
+            inv.failure_expires_in(retry_after.unwrap_or(DEFAULT_FAILURE_EXPIRY));
+        }
+    }
+}
+
 #[async_trait]
 impl Endpoint for HttpEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
@@ -848,6 +880,7 @@ impl Endpoint for HttpEndpoint {
                 // `Timeout` when the transport gave up waiting (a wait on the origin, not a
                 // bound of ours), else `Unavailable` (DNS, refused, TLS, dropped).
                 .map_err(|e| {
+                    self.origin_failing(inv, &thread, None);
                     status::transport_error(&e, &target, format!("http transport: {e}"))
                 })?;
 
@@ -957,6 +990,12 @@ impl Endpoint for HttpEndpoint {
         if let Some(err) =
             status::response_error(&response, inv.now(), format!("HTTP {}", response.status))
         {
+            if matches!(response.status, 429 | 500..=599) {
+                let retry_after = response
+                    .header("retry-after")
+                    .and_then(|value| status::retry_after(value, inv.now()));
+                self.origin_failing(inv, &thread, retry_after);
+            }
             return Err(err);
         }
 
@@ -3235,5 +3274,207 @@ mod tests {
         assert!(matches!(result(429).unwrap_err(), Error::RetryAfter { .. }));
         assert!(matches!(result(500).unwrap_err(), Error::Endpoint(_)));
         assert!(matches!(result(422).unwrap_err(), Error::Endpoint(_)));
+    }
+
+    // --- Negative caching (ledger #2666): a failing origin's answer is cached ---
+
+    /// A scripted answer: a status and its `Retry-After`, or a transport failure.
+    type Answer = std::result::Result<(u16, Option<&'static str>), &'static str>;
+
+    /// A transport answering per URL, counting sends per URL.
+    struct Origins {
+        answers: Vec<(&'static str, Answer)>,
+        sends: std::sync::Mutex<Vec<String>>,
+    }
+    impl Origins {
+        fn new(answers: Vec<(&'static str, Answer)>) -> Arc<Self> {
+            Arc::new(Origins {
+                answers,
+                sends: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn sends(&self, url: &str) -> usize {
+            self.sends
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|u| *u == url)
+                .count()
+        }
+    }
+    #[async_trait]
+    impl HttpTransport for Origins {
+        async fn send(&self, request: HttpRequest) -> std::result::Result<HttpResponse, String> {
+            self.sends.lock().unwrap().push(request.url.clone());
+            let (_, answer) = self
+                .answers
+                .iter()
+                .find(|(url, _)| *url == request.url)
+                .expect("a scripted URL");
+            let (status, retry_after) = (*answer).map_err(str::to_string)?;
+            let mut headers = vec![("content-type".to_string(), "text/plain".to_string())];
+            if let Some(value) = retry_after {
+                headers.push(("Retry-After".to_string(), value.to_string()));
+            }
+            Ok(HttpResponse {
+                status,
+                headers,
+                body: b"body".to_vec().into(),
+            })
+        }
+    }
+
+    const FAILING: &str = "https://down.example/feed";
+    const SECOND: u64 = 1_000;
+
+    /// Read `url` at kernel time `at`, on `kernel` whose clock is `clock`.
+    fn read_at(kernel: &Kernel, clock: &TestClock, at: u64, url: &str) -> Result<Representation> {
+        clock.set(at);
+        futures::executor::block_on(kernel.issue(get(url), &Capability::root()))
+    }
+
+    fn failing_kernel(answer: Answer) -> (Kernel, TestClock, Arc<Origins>) {
+        let origins = Origins::new(vec![(FAILING, answer)]);
+        let clock = TestClock::at(0);
+        let kernel =
+            Kernel::new(Arc::new(space(origins.clone()))).with_clock(Arc::new(clock.clone()));
+        (kernel, clock, origins)
+    }
+
+    #[test]
+    fn a_503_with_retry_after_is_served_from_the_cache_until_then() {
+        let (kernel, clock, origins) = failing_kernel(Ok((503, Some("30"))));
+        assert!(read_at(&kernel, &clock, 0, FAILING).is_err());
+        assert!(read_at(&kernel, &clock, 29 * SECOND, FAILING).is_err());
+        assert_eq!(
+            origins.sends(FAILING),
+            1,
+            "served the cached failure for 30 s"
+        );
+        assert!(read_at(&kernel, &clock, 30 * SECOND, FAILING).is_err());
+        assert_eq!(origins.sends(FAILING), 2, "refetched once it expired");
+    }
+
+    #[test]
+    fn retry_after_as_an_http_date_is_read_on_the_kernel_clock() {
+        // 2015-10-21T07:28:00Z, and a kernel clock 45 s before it.
+        let date = "Wed, 21 Oct 2015 07:28:00 GMT";
+        let start = 1_445_412_480_000 - 45 * SECOND;
+        let (kernel, clock, origins) = failing_kernel(Ok((429, Some(date))));
+        assert!(read_at(&kernel, &clock, start, FAILING).is_err());
+        assert!(read_at(&kernel, &clock, start + 44 * SECOND, FAILING).is_err());
+        assert_eq!(origins.sends(FAILING), 1);
+        assert!(read_at(&kernel, &clock, start + 45 * SECOND, FAILING).is_err());
+        assert_eq!(origins.sends(FAILING), 2);
+    }
+
+    #[test]
+    fn a_5xx_without_retry_after_uses_the_bounded_default() {
+        let default = DEFAULT_FAILURE_EXPIRY.as_secs() * SECOND;
+        assert_eq!(default, 60 * SECOND);
+        for answer in [
+            Ok((503, None)),
+            Ok((500, None)),
+            Ok((502, None)),
+            Ok((429, None)),
+            Ok((503, Some("in a bit"))),
+            Err("connection refused"),
+            Err("error sending request: operation timed out"),
+        ] {
+            let (kernel, clock, origins) = failing_kernel(answer);
+            assert!(read_at(&kernel, &clock, 0, FAILING).is_err());
+            assert!(read_at(&kernel, &clock, default - 1, FAILING).is_err());
+            assert_eq!(
+                origins.sends(FAILING),
+                1,
+                "{answer:?}: cached until the default"
+            );
+            assert!(read_at(&kernel, &clock, default, FAILING).is_err());
+            assert_eq!(origins.sends(FAILING), 2, "{answer:?}: refetched after it");
+        }
+    }
+
+    #[test]
+    fn a_4xx_other_than_429_is_never_cached_as_a_failure() {
+        for status in [400, 401, 403, 404, 410, 422] {
+            let (kernel, clock, origins) = failing_kernel(Ok((status, Some("30"))));
+            assert!(read_at(&kernel, &clock, 0, FAILING).is_err());
+            assert!(read_at(&kernel, &clock, 1, FAILING).is_err());
+            assert_eq!(
+                origins.sends(FAILING),
+                2,
+                "{status} recomputes on every read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_on_the_url_drops_a_cached_failure() {
+        let (kernel, clock, origins) = failing_kernel(Ok((503, Some("30"))));
+        assert!(read_at(&kernel, &clock, 0, FAILING).is_err());
+        let cut = Request::new(Verb::Sink, kernel_cut_iri()).with_arg(
+            "thread",
+            ArgRef::Inline(url_thread(&Url::parse(FAILING).unwrap()).into_bytes()),
+        );
+        futures::executor::block_on(kernel.issue(cut, &Capability::root())).unwrap();
+        assert!(read_at(&kernel, &clock, SECOND, FAILING).is_err());
+        assert_eq!(
+            origins.sends(FAILING),
+            2,
+            "the cut dropped the cached failure"
+        );
+    }
+
+    /// A feed composite over two URLs, one failing, that keeps what it could read:
+    /// cacheable until the failure's expiry, then recomputed.
+    #[test]
+    fn a_composite_over_a_failing_origin_stays_cacheable_until_the_failure_expires() {
+        const HEALTHY: &str = "https://up.example/feed";
+        let origins = Origins::new(vec![
+            (HEALTHY, Ok((200, None))),
+            (FAILING, Ok((503, Some("30")))),
+        ]);
+        let runs = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&runs);
+        let feed = ikigai_core::AsyncFnEndpoint::new("feed", move |inv| {
+            let counted = Arc::clone(&counted);
+            Box::pin(async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut merged = Vec::new();
+                for url in [HEALTHY, FAILING] {
+                    let read = get(url).with_arg("max_age", ArgRef::Inline(b"3600".to_vec()));
+                    if let Ok(repr) = inv.issue(read).await {
+                        merged.extend(repr.bytes);
+                    }
+                }
+                Ok(Representation::new(ReprType::new("text/plain"), merged).cacheable())
+            })
+        });
+        let clock = TestClock::at(0);
+        let kernel = Kernel::new(Arc::new(
+            endpoints(origins.clone()).bind(Exact::new("urn:feed:both"), feed),
+        ))
+        .with_clock(Arc::new(clock.clone()));
+        let read = |at: u64| {
+            clock.set(at);
+            let req = Request::new(Verb::Source, Iri::parse("urn:feed:both").unwrap());
+            futures::executor::block_on(kernel.issue(req, &Capability::root())).unwrap()
+        };
+        assert_eq!(read(0).bytes, b"body");
+        assert_eq!(read(29 * SECOND).bytes, b"body");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the composite was served from the cache"
+        );
+        assert_eq!(origins.sends(FAILING), 1);
+        read(30 * SECOND);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "recomputed when the failure expired"
+        );
+        assert_eq!(origins.sends(FAILING), 2);
+        assert_eq!(origins.sends(HEALTHY), 1, "the healthy read stayed cached");
     }
 }
