@@ -276,6 +276,11 @@ keep running on all eight. What it gives up is pinned by hand — the origin's l
 passes through, an unlabeled response gets the declared fallback, and a label
 with parameters is served as its bare media type.
 
+## Accessibility
+
+What this crate emits that people read (failures of a request, header and range errors), the
+rules that text follows and how to report a barrier are in [ACCESSIBILITY.md](ACCESSIBILITY.md).
+
 ## License
 
 MIT OR Apache-2.0.
