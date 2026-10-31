@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.1
+
+A cacheable read of a failing origin now states a failure expiry (ledger #2666):
+a 5xx or a 429 uses its `Retry-After` (delay-seconds or HTTP-date, on the kernel
+clock), else `DEFAULT_FAILURE_EXPIRY` (60 s); a connection failure or timeout uses
+the default. Core caches the failure until then (clamped to its failure ceiling),
+threaded on the URL so a cut drops it, and a composite that catches it stays
+cacheable until then. A 4xx other than 429 and a denial state nothing. The core
+floor is now 0.2.9, the first release with negative caching.
+
+## 0.5.0
 
 GET/HEAD preserve ETag and Last-Modified and send conditional requests when core
 offers a stale answer. A conditional 304 serves the stored body under its own
@@ -12,14 +22,6 @@ no-cache and max-age=0, must-revalidate now produce zero deadlines, including
 when the caller supplies max_age. Validator-only responses do too. With core
 0.2.7 (ledger #2553) these are stored for conditional revalidation, so each read
 revalidates and a 304 serves the stored body. The core floor is 0.2.7.
-
-A cacheable read of a failing origin now states a failure expiry (ledger #2666):
-a 5xx or a 429 uses its `Retry-After` (delay-seconds or HTTP-date, on the kernel
-clock), else `DEFAULT_FAILURE_EXPIRY` (60 s); a connection failure or timeout uses
-the default. Core caches the failure until then (clamped to its failure ceiling),
-threaded on the URL so a cut drops it, and a composite that catches it stays
-cacheable until then. A 4xx other than 429 and a denial state nothing. The core
-floor is now 0.2.9, the first release with negative caching.
 
 ## 0.4.3
 
