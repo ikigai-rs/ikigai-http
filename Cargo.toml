@@ -13,8 +13,9 @@ categories = ["web-programming::http-client", "wasm"]
 
 [dependencies]
 # 0.2.6 supplies stale offers, origin validators, and revalidated answers; 0.2.7
-# keeps an answer that arrives already expired when it carries a validator.
-ikigai-core = "0.2.7"
+# keeps an answer that arrives already expired when it carries a validator; 0.2.9
+# caches a failure its endpoint states an expiry for (`failure_expires_in`).
+ikigai-core = "0.2.9"
 async-trait = "0.1"
 # Runtime-independent AsyncRead for the host response-body seam.
 futures-io = "0.3"
