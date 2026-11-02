@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0 (ledger #1880)
+
+POST, PUT, PATCH, and DELETE declare `urn:cap:kernel:cut` alongside their network
+grant, so the kernel denies callers lacking cut authority before sending the
+write. Validation and the manifold now expose that requirement. Safe methods
+continue to need only network authority.
+
+`Method` is now non-exhaustive: downstream matches need a fallback arm so future
+methods can be added. Corrected the crate docs to reflect the existing header,
+body, range, and authorization arguments. Deprecated aliases remain bound under
+the existing migration policy.
+
 ## 0.5.1
 
 A cacheable read of a failing origin now states a failure expiry (ledger #2666):
