@@ -102,6 +102,11 @@ assert_eq!(err.to_string(), "retry later: rate-limited: HTTP 429");
 
 ## Capabilities
 
+POST, PUT, PATCH, and DELETE additionally require `urn:cap:kernel:cut` so a
+successful write invalidates cached reads of its URL. The kernel checks this
+requirement before transport; network grants alone cannot invoke a write.
+GET, HEAD, PROPFIND, and REPORT need no cut authority.
+
 Calls are gated by `urn:cap:net:<host>[:<port>][/<path-prefix>]` scopes (a leading
 `-` denies), matched most-specific-wins, deny-breaks-ties, segment-aware,
 default-deny. A `root` capability allows everything. The host may be a leftmost-label
