@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 (ledger #1880)
 
 POST, PUT, PATCH, and DELETE declare `urn:cap:kernel:cut` alongside their network
 grant, so the kernel denies callers lacking cut authority before sending the
