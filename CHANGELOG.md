@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+The public API now speaks core 0.3 types: the core floor is 0.3.0, the scoped
+content store (ledger #2965), where held content belongs to whoever delivered it
+and `ContentStore::put` and `put_replay` are root-only. This crate calls neither,
+so its behavior does not change. A host on core 0.2 stays on 0.5. The conformance
+dev-dependency moves to 0.14.0.
+
 ## 0.5.1
 
 A cacheable read of a failing origin now states a failure expiry (ledger #2666):

@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-http"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Outbound HTTP-client ikigai module: one endpoint per method (urn:http:get…urn:http:delete, plus WebDAV urn:http:propfind and urn:http:report) with the ROC verb mirroring HTTP idempotency, a urn:cap:net host/path-ACL, golden-thread + time-based caching. A cfg-gated backend links into native and wasm32 hosts from one crate."
@@ -14,8 +14,9 @@ categories = ["web-programming::http-client", "wasm"]
 [dependencies]
 # 0.2.6 supplies stale offers, origin validators, and revalidated answers; 0.2.7
 # keeps an answer that arrives already expired when it carries a validator; 0.2.9
-# caches a failure its endpoint states an expiry for (`failure_expires_in`).
-ikigai-core = "0.2.9"
+# caches a failure its endpoint states an expiry for (`failure_expires_in`); 0.3.0
+# scopes held content to whoever delivered it (the scoped content store, ledger #2965).
+ikigai-core = "0.3.0"
 async-trait = "0.1"
 # Runtime-independent AsyncRead for the host response-body seam.
 futures-io = "0.3"
@@ -41,8 +42,8 @@ httpdate = "1.0.3"
 [dev-dependencies]
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`), including BODIES
-# and BODY-INPUTS by default since 0.12.0.
-ikigai-conformance = "0.12.0"
+# and BODY-INPUTS by default since 0.12.0; 0.14.0 is the release on core 0.3.0.
+ikigai-conformance = "0.14.0"
 # Reads `tests/vectors/auth_vectors.json`, the shared Authorization and base64 vectors
 # Python and Deno pin a byte-identical copy of (ledger #1857). `Value` indexing only.
 serde_json = "1"
