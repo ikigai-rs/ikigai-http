@@ -759,7 +759,7 @@ fn every_verb_is_denied_before_any_socket_opens() {
     let url = origin.url("/live");
     for (capability, gate) in [
         (scoped(&[]), NET_WILDCARD),
-        (scoped(&[OTHER_SCOPE]), "127.0.0.1"),
+        (scoped(&[OTHER_SCOPE, "urn:cap:kernel:cut"]), "127.0.0.1"),
     ] {
         for (id, iri, verb) in METHODS {
             let err = issue(
@@ -798,6 +798,52 @@ fn every_verb_is_denied_before_any_socket_opens() {
         1,
         "a granted host connects exactly once"
     );
+}
+
+/// Network authority alone cannot start a write; preflight exposes the same
+/// missing scope, and adding it permits the request at the origin.
+#[test]
+fn writes_require_cut_authority_before_opening_a_socket() {
+    let origin = Origin::start();
+    let kernel = kernel();
+    let url = origin.url("/live");
+    let net = scoped(&[ORIGIN_SCOPE]);
+    let writer = scoped(&[ORIGIN_SCOPE, "urn:cap:kernel:cut"]);
+    for (id, iri, verb) in METHODS {
+        if !matches!(id, "http-post" | "http-put" | "http-patch" | "http-delete") {
+            continue;
+        }
+        let action_verb = if verb == Verb::Delete {
+            "delete"
+        } else {
+            "sink"
+        };
+        let action = format!("urn:ikigai:endpoint:{id}:action:{action_verb}");
+        for (cap, conforms) in [(&net, false), (&writer, true)] {
+            let validation = issue(
+                &kernel,
+                Verb::Source,
+                "urn:kernel:validate",
+                &[("action", &action), ("args", &format!("url={url}"))],
+                cap,
+            )
+            .unwrap();
+            let report = String::from_utf8(validation.bytes).unwrap();
+            assert!(
+                report.contains(&format!("sh:conforms {conforms}")),
+                "{id}: {report}"
+            );
+            if !conforms {
+                assert!(report.contains("urn:cap:kernel:cut"), "{id}: {report}");
+            }
+        }
+        let before = origin.connections();
+        let err = issue(&kernel, verb, iri, &[("url", &url)], &net).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{id}: {err:?}");
+        assert_eq!(origin.connections(), before, "{id}: denied before socket");
+        issue(&kernel, verb, iri, &[("url", &url)], &writer).unwrap();
+        assert_eq!(origin.connections(), before + 1, "{id}: authorized write");
+    }
 }
 
 /// A redirect to a host outside the allowlist dies at the ACL before the hop is
@@ -850,7 +896,7 @@ fn a_redirect_off_the_allowlist_is_denied_before_the_hop() {
         Verb::Sink,
         "urn:http:post",
         &[("url", &origin.url("/hop-in")), ("content", "payload")],
-        &cap,
+        &scoped(&[ORIGIN_SCOPE, "urn:cap:kernel:cut"]),
     )
     .unwrap_err();
     assert!(
@@ -1148,7 +1194,7 @@ fn propfind_and_report_reach_the_origin_as_dav_requests() {
 }
 
 /// The contract as the manifold states it: every action declares the net
-/// wildcard and nothing else, every input has a class, only `url` is required,
+/// wildcard plus cut authority for writes, every input has a class, only `url` is required,
 /// the cacheable verbs take `max_age`, the mutating ones take `content` and
 /// `content_type`.
 #[test]
@@ -1160,7 +1206,11 @@ fn the_manifold_states_the_contract() {
         assert_eq!(specs.len(), 1, "{id}: one action");
         let spec = &specs[0];
         assert_eq!(spec.verb, verb, "{id}");
-        assert_eq!(spec.requires, [NET_WILDCARD], "{id}: declared = enforced");
+        let mut required_scopes = vec![NET_WILDCARD];
+        if matches!(id, "http-post" | "http-put" | "http-patch" | "http-delete") {
+            required_scopes.push("urn:cap:kernel:cut");
+        }
+        assert_eq!(spec.requires, required_scopes, "{id}: declared = enforced");
         let names: Vec<&str> = spec.inputs.iter().map(|i| i.name.as_str()).collect();
         let required: Vec<&str> = spec
             .inputs
