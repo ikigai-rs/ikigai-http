@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0 (ledger #1880)
+
+POST, PUT, PATCH, and DELETE now declare `urn:cap:kernel:cut` alongside their
+network grant. Before this change, a caller holding only `urn:cap:net` grants
+could send a write the origin applied, then get `Denied` when the endpoint cut
+the URL's cached reads, which reported failure for a write that had happened.
+The kernel now denies such a caller before the request goes out, and
+`urn:kernel:validate` and the manifold state the requirement. A host that grants
+writes with network scopes only must add `urn:cap:kernel:cut`. Core's cut
+capability is not scoped per thread, so this grant can cut any thread. Safe
+methods (GET, HEAD, PROPFIND, REPORT) still need only network authority.
+
+`Method` is now `#[non_exhaustive]`, so adding a method no longer breaks
+consumers: a downstream `match` on it needs a fallback arm. The crate docs no
+longer say header, body, range, and authorization arguments are still to come;
+the endpoints already take them. Deprecated aliases stay bound under the
+existing migration policy.
+
 ## 0.6.0
 
 The public API now speaks core 0.3 types: the core floor is 0.3.0, the scoped
