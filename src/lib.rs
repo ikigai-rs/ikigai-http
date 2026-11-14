@@ -188,7 +188,15 @@
 //!
 //! The credential to authenticate with (when one is needed) is itself meant to be
 //! capability-gated — the agent gets "may call host X with credential Y", never the
-//! raw token — but that, and headers/body/range/auth args, land with the backend.
+//! raw token. Credential lookup and capability-gated injection remain host concerns.
+//! The endpoints already accept headers, body content, range, and authorization
+//! arguments; see their action descriptions.
+//!
+//! POST, PUT, PATCH, and DELETE also require `urn:cap:kernel:cut` to invalidate
+//! cached reads of the URL after a successful write. The kernel checks this
+//! declared scope before invoking the endpoint, so a caller with only network
+//! grants is denied before the request goes out. GET, HEAD, PROPFIND, and REPORT
+//! need no cut authority.
 //!
 //! ## Authorization headers and base64: the shared helpers
 //!
@@ -306,7 +314,20 @@ const XSD_NON_NEGATIVE_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#nonNega
 
 /// One endpoint per HTTP method; the variant fixes the method, the ROC verb it is
 /// resolved with, and (via the verb) its cacheability.
+/// New methods may be added; consumers must handle unknown variants.
+///
+/// A match listing only today's methods is rejected outside this crate:
+///
+/// ```compile_fail,E0004
+/// use ikigai_http::Method;
+/// let method = Method::Get;
+/// match method {
+///     Method::Get | Method::Head | Method::Post | Method::Put | Method::Patch
+///     | Method::Delete | Method::Propfind | Method::Report => {}
+/// }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum Method {
     Get,
     Head,
@@ -1001,8 +1022,8 @@ impl Endpoint for HttpEndpoint {
 
         // A *successful* mutating method invalidates any cached representation of the same URL by
         // cutting its thread through the kernel (so it works the same over the wire; needs
-        // `urn:cap:kernel:cut`, which `root` has). On an error status we returned above without
-        // cutting — a failed write leaves the cached read valid.
+        // `urn:cap:kernel:cut`, declared on the action and checked before invocation).
+        // An error status returned above without cutting, leaving the cached read valid.
         if self.method.is_mutating() {
             let cut = Request::new(Verb::Sink, kernel_cut_iri())
                 .with_arg("thread", ArgRef::Inline(thread.clone().into_bytes()));
@@ -1095,6 +1116,9 @@ impl Endpoint for HttpEndpoint {
                 "headers",
                 "extra request headers, one `Name: Value` per line",
             ));
+        if self.method.is_mutating() {
+            description = description.requires("urn:cap:kernel:cut");
+        }
         if self.method.is_cacheable() {
             description = description.input(
                 ArgSpec::new("max_age")
@@ -1976,27 +2000,45 @@ mod tests {
     }
 
     #[test]
+    fn writes_without_cut_authority_are_denied_before_transport() {
+        for method in [Method::Post, Method::Put, Method::Patch, Method::Delete] {
+            let transport = Record::new(resp(None));
+            let kernel = Kernel::new(Arc::new(space(transport.clone())));
+            let cap = Capability::scoped(["urn:cap:net:example.com"]);
+            for iri in [method.iri(), method.deprecated_iri()] {
+                let request = Request::new(method.verb(), Iri::parse(iri).unwrap())
+                    .with_arg("url", ArgRef::Inline(b"https://example.com/x".to_vec()));
+                let err = futures::executor::block_on(kernel.issue(request, &cap)).unwrap_err();
+                assert!(matches!(err, Error::Denied(_)), "{method:?}: {err:?}");
+                assert!(
+                    transport.requests().is_empty(),
+                    "{method:?}: write reached origin before denial"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_mutating_call_cuts_the_url_thread() {
-        let transport = Arc::new(Mock::new(resp(Some("max-age=600"))));
-        let clock = TestClock::at(0);
-        let kernel =
-            Kernel::new(Arc::new(space(transport.clone()))).with_clock(Arc::new(clock.clone()));
-        let cap = Capability::root(); // root carries urn:cap:kernel:cut
-        let url = "https://example.com/x";
+        for method in [Method::Post, Method::Put, Method::Patch, Method::Delete] {
+            let transport = Arc::new(Mock::new(resp(Some("max-age=600"))));
+            let kernel = Kernel::new(Arc::new(space(transport.clone())))
+                .with_clock(Arc::new(TestClock::at(0)));
+            let cap = Capability::scoped(["urn:cap:net:example.com", "urn:cap:kernel:cut"]);
+            let url = "https://example.com/x";
 
-        futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
-        futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
-        assert_eq!(transport.gets(), 1, "cached well within max-age");
+            futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
+            futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
+            assert_eq!(transport.gets(), 1, "{method:?}: cached within max-age");
 
-        // A POST to the same URL cuts its golden thread.
-        let post = Request::new(Verb::Sink, Iri::parse("urn:http:post").unwrap())
-            .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
-            .with_arg("content", ArgRef::Inline(b"data".to_vec()));
-        futures::executor::block_on(kernel.issue(post, &cap)).unwrap();
+            let write = Request::new(method.verb(), Iri::parse(method.iri()).unwrap())
+                .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()))
+                .with_arg("content", ArgRef::Inline(b"data".to_vec()));
+            futures::executor::block_on(kernel.issue(write, &cap)).unwrap();
 
-        // The cached GET is now invalid even though its deadline hasn't passed.
-        futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
-        assert_eq!(transport.gets(), 2, "GET recomputed after the mutating cut");
+            futures::executor::block_on(kernel.issue(get(url), &cap)).unwrap();
+            assert_eq!(transport.gets(), 2, "{method:?}: GET recomputed after cut");
+        }
     }
 
     // --- Deprecated names (kept through 0.3.x; removed in a later minor) ---
