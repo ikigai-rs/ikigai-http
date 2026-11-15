@@ -5,7 +5,7 @@
 Add `status::response_error_for_status(&response, now, detail)` for callers that
 have already checked that the status is at least 400. It returns `Error` directly
 using the existing status table and `Retry-After` handling, removing the need for
-an `unwrap_or(Error::Endpoint(detail))` fallback. It panics for statuses below 400;
+an `unwrap_or(Error::Endpoint(detail))` fallback. A status below 400 answers `Error::Endpoint(detail)` rather than panicking;
 `response_error` remains available for responses that have not been checked.
 
 ## 0.7.2 (ledger #1869)

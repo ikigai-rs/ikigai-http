@@ -160,10 +160,9 @@ pub fn response_error(
 /// has already checked to be at least 400. Uses the same status table, `Retry-After`
 /// parsing, kernel clock, and detail text as [`response_error`].
 ///
-/// # Panics
-///
-/// Panics if `response.status` is below 400. Use [`response_error`] to classify a
-/// response whose status has not been checked.
+/// It never panics: a status below 400 (a caller that did not check after all) answers
+/// `Error::Endpoint(detail)`, the fallback callers used to write by hand. Use
+/// [`response_error`] to classify a response whose status has not been checked.
 ///
 /// ```
 /// use ikigai_core::Error;
@@ -184,12 +183,8 @@ pub fn response_error_for_status(
     now: Option<Time>,
     detail: impl Into<String>,
 ) -> Error {
-    assert!(
-        response.status >= 400,
-        "response_error_for_status requires an HTTP status of at least 400"
-    );
-    response_error(response, now, detail)
-        .expect("HTTP statuses of at least 400 always map to an error")
+    let detail = detail.into();
+    response_error(response, now, detail.clone()).unwrap_or(Error::Endpoint(detail))
 }
 
 /// Parse a `Retry-After` value (RFC 9110 §10.2.3): **delay-seconds** (one or more
@@ -469,16 +464,15 @@ mod tests {
         assert!(matches!(&error, Error::Unavailable(detail) if detail == "GET /resource"));
     }
 
+    /// A status below 400 never panics: it answers the hand-written fallback.
     #[test]
-    fn checked_error_response_rejects_statuses_below_400() {
+    fn checked_error_response_below_400_is_an_endpoint_error() {
         for status in [0, 100, 199, 200, 299, 300, 304, 399] {
+            let response = with_retry_after(status, "7");
+            let error = response_error_for_status(&response, None, "not an error");
             assert!(
-                std::panic::catch_unwind(|| {
-                    let response = with_retry_after(status, "7");
-                    response_error_for_status(&response, None, "not an error")
-                })
-                .is_err(),
-                "{status}"
+                matches!(&error, Error::Endpoint(detail) if detail == "not an error"),
+                "{status}: {error:?}"
             );
         }
     }
