@@ -249,4 +249,4 @@
     { "name": "nonzero-four-unused-bits", "source": "RFC 4648 sections 3.3, 3.5 and 5; canonical unpadded profile", "encoded": "Zh", "error": "base64-invalid" },
     { "name": "nonzero-two-unused-bits", "source": "RFC 4648 sections 3.3, 3.5 and 5; canonical unpadded profile", "encoded": "Zm9", "error": "base64-invalid" }
   ]
- }
+}
