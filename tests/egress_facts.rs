@@ -1,6 +1,7 @@
 //! Facts about today's endpoints that `docs/egress-credentials.md` builds on. Nothing
 //! here tests the egress door, which does not exist yet: each test pins a behavior
-//! the design says the door must override, so a change to it shows up here first.
+//! the design builds on or says the door must override, so a change to it shows up
+//! here first.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -82,22 +83,58 @@ impl HttpTransport for NamesTheUrl {
     }
 }
 
-/// A transport failure's words reach the caller's error text unchanged, URL and query
-/// included. A credential substituted into a query parameter would therefore leak
-/// through an ordinary connection failure, so the door must scrub every error it
-/// returns (the design's "Echoes" section).
+/// A transport failure's words reach the caller's error text with the URL cut down to
+/// its scheme, host, port and path: the query, the fragment and any userinfo never do,
+/// so a credential in a query parameter or in `user:pass@` cannot leak through an
+/// ordinary connection failure (ledger #3767). The door still scrubs every error it
+/// returns for a value placed anywhere else (the design's "Echoes" section).
 #[test]
-fn a_transport_failure_repeats_the_url_into_the_error_text() {
+fn a_transport_failure_names_the_url_without_its_query_or_userinfo() {
     let kernel = Kernel::new(Arc::new(space(Arc::new(NamesTheUrl))));
     let cap = Capability::scoped(["urn:cap:net:api.example.com"]);
-    let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap()).with_arg(
-        "url",
-        ArgRef::Inline(b"https://api.example.com/v1/me?api_key=s3cr3t-value".to_vec()),
-    );
+    for (url, secrets) in [
+        (
+            "https://api.example.com/v1/me?api_key=s3cr3t-value",
+            &["s3cr3t-value", "api_key", "?"][..],
+        ),
+        (
+            "https://api.example.com/v1/me?key=s3cr3t-value&token=t0ken-value#frag-value",
+            &["s3cr3t-value", "t0ken-value", "frag-value", "?", "#"][..],
+        ),
+        (
+            "https://user:pa55word@api.example.com/v1/me",
+            &["user", "pa55word", "@"][..],
+        ),
+        (
+            "https://user:pa55word@api.example.com:8443/v1/me?token=t0ken-value",
+            &["user", "pa55word", "@", "t0ken-value"][..],
+        ),
+    ] {
+        let request = Request::new(Verb::Source, Iri::parse("urn:http:get").unwrap())
+            .with_arg("url", ArgRef::Inline(url.as_bytes().to_vec()));
+        let cap = if url.contains(":8443") {
+            Capability::scoped(["urn:cap:net:api.example.com:8443"])
+        } else {
+            cap.clone()
+        };
 
-    let err = block_on(kernel.issue(request, &cap)).unwrap_err();
-    assert!(
-        err.to_string().contains("api_key=s3cr3t-value"),
-        "the query reached the error text: {err}"
-    );
+        let text = block_on(kernel.issue(request, &cap))
+            .unwrap_err()
+            .to_string();
+        for secret in secrets {
+            assert!(
+                !text.contains(secret),
+                "{secret:?} reached the error text: {text}"
+            );
+        }
+        let port = if url.contains(":8443") { ":8443" } else { "" };
+        assert!(
+            text.contains(&format!("https://api.example.com{port}/v1/me")),
+            "the scheme, host, port and path still name the request: {text}"
+        );
+        assert!(
+            text.contains("connection refused"),
+            "the failure is still said: {text}"
+        );
+    }
 }

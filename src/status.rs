@@ -82,6 +82,7 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use ikigai_core::{Error, Time};
+use url::Url;
 
 use crate::HttpResponse;
 
@@ -207,8 +208,14 @@ pub fn retry_after(value: &str, now: Option<Time>) -> Option<Duration> {
 ///
 /// The trait reports failure as a string, so a timeout can only be recognized by its
 /// words ("timed out" or "timeout": ureq, reqwest and a browser's fetch each say one).
-/// `url` is removed before looking, so a host named `timeout.example` cannot type its own
-/// refusals. `detail` becomes the error's message.
+/// `url` and its host are removed before looking, so a host named `timeout.example`
+/// cannot type its own refusals. `detail` becomes the error's message.
+///
+/// Common clients name the URL in that string, and a caller may have put a credential in
+/// its query (`?api_key=…`) or its userinfo (`user:pass@`). So wherever `url` appears in
+/// `detail` it is cut down to its scheme, host, port and path, and its query, fragment
+/// and userinfo are removed wherever else they appear (ledger #3767). Every caller gets
+/// this, so none has to remember it.
 ///
 /// ```
 /// use ikigai_core::Error;
@@ -219,20 +226,78 @@ pub fn retry_after(value: &str, now: Option<Time>) -> Option<Duration> {
 /// assert!(matches!(slow, Error::Timeout(_)));
 /// let down = transport_error(&format!("connection refused: {url}"), url, "http transport: refused");
 /// assert!(matches!(down, Error::Unavailable(_)));
+///
+/// let url = "https://user:pass@api.example.com/v1/me?api_key=secret";
+/// let said = format!("error sending request for url ({url})");
+/// let err = transport_error(&said, url, format!("http transport: {said}"));
+/// assert_eq!(
+///     err.to_string(),
+///     "unavailable: http transport: error sending request for url (https://api.example.com/v1/me)"
+/// );
 /// ```
 ///
 /// [`HttpTransport::send`]: crate::HttpTransport::send
 pub fn transport_error(error: &str, url: &str, detail: impl Into<String>) -> Error {
-    let words = if url.is_empty() {
-        error.to_ascii_lowercase()
-    } else {
-        error.replace(url, "").to_ascii_lowercase()
+    let parsed = Url::parse(url).ok();
+    let scrub = |text: &str| match &parsed {
+        Some(parsed) => scrub_url(text, url, parsed),
+        None => text.to_string(),
     };
-    if words.contains("timed out") || words.contains("timeout") {
-        Error::Timeout(detail.into())
-    } else {
-        Error::Unavailable(detail.into())
+    let named = parsed
+        .as_ref()
+        .map_or_else(|| url.to_string(), without_secrets);
+    let host = parsed.as_ref().and_then(Url::host_str).unwrap_or_default();
+    let mut words = scrub(error);
+    for name in [named.as_str(), host] {
+        if !name.is_empty() {
+            words = words.replace(name, "");
+        }
     }
+    let words = words.to_ascii_lowercase();
+    let detail = scrub(&detail.into());
+    if words.contains("timed out") || words.contains("timeout") {
+        Error::Timeout(detail)
+    } else {
+        Error::Unavailable(detail)
+    }
+}
+
+/// `url` as an error may name it: scheme, host, port and path, without its userinfo,
+/// query or fragment.
+fn without_secrets(url: &Url) -> String {
+    let mut named = url.clone();
+    // Both fail only for a URL that cannot carry userinfo, which then has none.
+    let _ = named.set_username("");
+    let _ = named.set_password(None);
+    named.set_query(None);
+    named.set_fragment(None);
+    named.to_string()
+}
+
+/// `text` with `url` (written as `raw` or as `url` serializes) replaced by
+/// [`without_secrets`], and its query, fragment and userinfo removed wherever else they
+/// still appear, for a transport that writes the URL in a form of its own.
+fn scrub_url(text: &str, raw: &str, url: &Url) -> String {
+    let named = without_secrets(url);
+    let mut text = text.replace(raw, &named).replace(url.as_str(), &named);
+    let userinfo = match url.password() {
+        Some(password) => format!("{}:{password}@", url.username()),
+        None if !url.username().is_empty() => format!("{}@", url.username()),
+        None => String::new(),
+    };
+    let pieces = [
+        url.query()
+            .filter(|query| !query.is_empty())
+            .map(|query| format!("?{query}")),
+        url.fragment()
+            .filter(|fragment| !fragment.is_empty())
+            .map(|fragment| format!("#{fragment}")),
+        (!userinfo.is_empty()).then_some(userinfo),
+    ];
+    for piece in pieces.into_iter().flatten() {
+        text = text.replace(&piece, "");
+    }
+    text
 }
 
 #[cfg(test)]
@@ -443,5 +508,39 @@ mod tests {
             let err = transport_error(&said, url, said.clone());
             assert!(matches!(err, Error::Unavailable(_)), "{said}: {err:?}");
         }
+    }
+
+    /// The URL a failure names loses its userinfo, query and fragment, written whole or
+    /// in pieces of the transport's own, and the scrubbing never changes the class.
+    #[test]
+    fn a_transport_failure_never_repeats_a_query_fragment_or_userinfo() {
+        let url = "https://u:p4ss@timeout.example:8443/a/b?api_key=s3cr3t#fr4g";
+        for (said, want) in [
+            (
+                format!("error sending request for url ({url})"),
+                "error sending request for url (https://timeout.example:8443/a/b)",
+            ),
+            (
+                "refused: u:p4ss@timeout.example:8443/a/b?api_key=s3cr3t".to_string(),
+                "refused: timeout.example:8443/a/b",
+            ),
+        ] {
+            let err = transport_error(&said, url, said.clone());
+            assert!(matches!(err, Error::Unavailable(_)), "{said}: {err:?}");
+            assert_eq!(err.to_string(), format!("unavailable: {want}"));
+        }
+        let err = transport_error(
+            &format!("{url}: timed out"),
+            url,
+            format!("{url}: timed out"),
+        );
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "timeout: https://timeout.example:8443/a/b: timed out"
+        );
+        // Text that is not about a URL passes through as it was.
+        let err = transport_error("reset? by peer", "response body", "reset? by peer");
+        assert_eq!(err.to_string(), "unavailable: reset? by peer");
     }
 }

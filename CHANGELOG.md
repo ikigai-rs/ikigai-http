@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.1 (ledger #3767)
+
+Security fix: a transport failure no longer repeats the request URL's query,
+fragment, or userinfo into the caller's error text. Common HTTP clients name the
+URL when a request fails, and the endpoints wrapped that text unchanged, so a
+credential passed as `?api_key=…`, `?token=…`, or `https://user:pass@host/`
+reached the error string, and from there any log, trace, or tool result that
+carried it. `status::transport_error`, the one place transport text enters an
+error, now cuts the URL down to its scheme, host, port, and path wherever it
+appears in the message, and removes the query, fragment, and userinfo wherever
+else they still appear. Other modules that call it get the same scrubbing. It also
+ignores the bare host when deciding whether a failure was a timeout, so a host
+named `timeout.example` cannot make its own refusal a timeout.
+
 ## 0.7.0 (ledger #1880)
 
 POST, PUT, PATCH, and DELETE now declare `urn:cap:kernel:cut` alongside their

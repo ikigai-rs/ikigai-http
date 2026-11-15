@@ -229,8 +229,10 @@
 //!   `Unavailable`; 502 → `Unavailable`; 501 → `Unsupported`; **500 and every other 5xx →
 //!   `Endpoint`** (unknown, not transient); any other status → `Endpoint`.
 //! - A transport-level failure is `Timeout` when the transport says it timed out, else
-//!   `Unavailable` ([`status::transport_error`]). Each action declares these classes
-//!   ([`Description::fails`]), so the manifold says what can go wrong before anything does.
+//!   `Unavailable` ([`status::transport_error`]). Its text names the URL by scheme, host,
+//!   port and path only, never its query, fragment or userinfo, which may hold a credential.
+//!   Each action declares these classes ([`Description::fails`]), so the manifold says what
+//!   can go wrong before anything does.
 //! - **A failing origin's failure is cached** (ledger #2666): on a cacheable read, a 5xx or a
 //!   429 states a failure expiry (`Invocation::failure_expires_in`) of its `Retry-After`, else
 //!   [`DEFAULT_FAILURE_EXPIRY`]; so does a transport failure. The kernel serves the failure

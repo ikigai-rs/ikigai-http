@@ -89,7 +89,8 @@ keeping a copy:
 `Retry-After` is read in both forms: delay-seconds, or an HTTP-date measured on the
 kernel's injected clock (no clock, or a malformed value, means no delay). A
 transport that gives up waiting is `Timeout`; any other transport failure is
-`Unavailable`. `Denied` is now only the capability floor's word: our grant did not
+`Unavailable`. Its message names the URL by scheme, host, port and path, never its
+query, fragment or userinfo. `Denied` is now only the capability floor's word: our grant did not
 cover the URL. Each action declares its failure classes (`Description::fails`), so
 the manifold says what can go wrong before anything does. HEAD stays lenient: any
 answered status but 404/410 is `true`, except for the explicit 304 result below.
