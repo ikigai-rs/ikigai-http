@@ -141,6 +141,9 @@ pub fn status_error(
 /// [`retry_after`] against `now` (the kernel's clock, [`Invocation::now`]), so an
 /// HTTP-date delay is measured on the same clock as everything else the kernel times.
 ///
+/// Call [`response_error_for_status`] when the caller has already checked that the
+/// status is at least 400 and needs an [`Error`] directly.
+///
 /// [`Invocation::now`]: ikigai_core::Invocation::now
 pub fn response_error(
     response: &HttpResponse,
@@ -151,6 +154,42 @@ pub fn response_error(
         .header("retry-after")
         .and_then(|value| retry_after(value, now));
     status_error(response.status, delay, detail)
+}
+
+/// The non-optional form of [`response_error`] for a response whose status the caller
+/// has already checked to be at least 400. Uses the same status table, `Retry-After`
+/// parsing, kernel clock, and detail text as [`response_error`].
+///
+/// # Panics
+///
+/// Panics if `response.status` is below 400. Use [`response_error`] to classify a
+/// response whose status has not been checked.
+///
+/// ```
+/// use ikigai_core::Error;
+/// use ikigai_http::{HttpResponse, status::response_error_for_status};
+///
+/// let response = HttpResponse {
+///     status: 403,
+///     headers: Vec::new(),
+///     body: Vec::new().into(),
+/// };
+/// if response.status >= 400 {
+///     let error: Error = response_error_for_status(&response, None, "HTTP 403");
+///     assert!(matches!(error, Error::Refused(_)));
+/// }
+/// ```
+pub fn response_error_for_status(
+    response: &HttpResponse,
+    now: Option<Time>,
+    detail: impl Into<String>,
+) -> Error {
+    assert!(
+        response.status >= 400,
+        "response_error_for_status requires an HTTP status of at least 400"
+    );
+    response_error(response, now, detail)
+        .expect("HTTP statuses of at least 400 always map to an error")
 }
 
 /// Parse a `Retry-After` value (RFC 9110 §10.2.3): **delay-seconds** (one or more
@@ -396,6 +435,51 @@ mod tests {
             status,
             headers: vec![("retry-after".into(), value.into())],
             body: Vec::new().into(),
+        }
+    }
+
+    #[test]
+    fn checked_error_responses_need_no_optional_fallback() {
+        let now = Some(Time::from_millis(1_445_412_480_000 - 90_000));
+        for status in (400..=599).chain([600, u16::MAX]) {
+            for header in ["7", "Wed, 21 Oct 2015 07:28:00 GMT", "invalid"] {
+                let response = with_retry_after(status, header);
+                // A caller that already checked the status needs an Error directly.
+                let error: Error = response_error_for_status(&response, now, "request failed");
+                let existing = response_error(&response, now, "request failed").unwrap();
+                assert_eq!(error.kind(), existing.kind(), "{status}: {header}");
+                assert_eq!(
+                    error.to_string(),
+                    existing.to_string(),
+                    "{status}: {header}"
+                );
+                assert_eq!(error.retry_after_millis(), existing.retry_after_millis());
+            }
+        }
+    }
+
+    #[test]
+    fn checked_error_response_without_retry_after_preserves_detail() {
+        let response = HttpResponse {
+            status: 503,
+            headers: Vec::new(),
+            body: Vec::new().into(),
+        };
+        let error = response_error_for_status(&response, None, String::from("GET /resource"));
+        assert!(matches!(&error, Error::Unavailable(detail) if detail == "GET /resource"));
+    }
+
+    #[test]
+    fn checked_error_response_rejects_statuses_below_400() {
+        for status in [0, 100, 199, 200, 299, 300, 304, 399] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let response = with_retry_after(status, "7");
+                    response_error_for_status(&response, None, "not an error")
+                })
+                .is_err(),
+                "{status}"
+            );
         }
     }
 
