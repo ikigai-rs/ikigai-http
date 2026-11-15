@@ -1,7 +1,8 @@
 # The egress credential door
 
 Status: design spike (ledger #3751). Nothing here is built yet. The only code in this change is
-`tests/egress_facts.rs`, which pins two current behaviors the design has to override.
+`tests/egress_facts.rs`, which pins two current behaviors the design builds on or has to
+override.
 
 ## The problem
 
@@ -36,7 +37,7 @@ crates.
 | The endpoint, not the transport, follows redirects, and only for GET and HEAD. Body-sending methods refuse any 3xx. | `src/lib.rs:860-933`, test `mutating_methods_never_follow_redirects` (`src/lib.rs:3008`) | The door keeps that behavior and narrows it further (see "Redirects"). |
 | On a cross-origin hop the endpoint strips `Authorization`, `Proxy-Authorization` and `Cookie`, and nothing else. A downgrade from `https` to `http` on the same host counts as cross-origin, so it is followed with those three headers removed. | `src/lib.rs:934-942`; tests `cross_origin_redirect_drops_credentials` (`src/lib.rs:2902`) and `redirect_credentials_follow_origin_boundaries`, case `http://a.example/` (`src/lib.rs:2932`) | Not enough for the door. A secret placed in a custom header or a query parameter would survive that strip, so the door refuses those redirects. |
 | A GET that carries `authorization=` is cached like any other read. The credential is part of the request identity. | Pinned by `a_get_carrying_a_credential_is_cached_today` (`tests/egress_facts.rs`); freshness is applied at `src/lib.rs:1038-1045` | The door cannot reuse the read path as it is. It has to make its own answers uncacheable. |
-| A transport failure's text goes into the error unchanged, URL and query included: `format!("http transport: {e}")`. | `src/lib.rs:903-906`, `src/status.rs:225-236`; pinned by `a_transport_failure_repeats_the_url_into_the_error_text` (`tests/egress_facts.rs`) | Every error the door returns passes through the scrubber (see "Echoes"). |
+| A transport failure's text goes into the error with the request URL cut down to its scheme, host, port and path. Its query, fragment and userinfo are removed (ledger #3767). The rest of the transport's text is kept. | `status::transport_error` (`src/status.rs`); pinned by `a_transport_failure_names_the_url_without_its_query_or_userinfo` (`tests/egress_facts.rs`) | A query or userinfo placement cannot leak through a connection failure. A value placed anywhere else can, so every error the door returns still passes through the scrubber (see "Echoes"). |
 | A non-success status becomes a typed error carrying only `HTTP <status>`. The origin's error body is dropped unread. | `src/lib.rs:1008-1021` | An error page that echoes the credential never reaches the caller. Only successful bodies have to be scanned. |
 | `auth::basic` and `auth::bearer` are the one place a `Basic` or `Bearer` header is built. `Authorization` has no `Display`, its `Debug` redacts, and `AuthError` never carries the value. `credentials()` is the encoded form a scrubber must also look for. | `src/auth.rs:10-15`, `src/auth.rs:84-95`, `src/auth.rs:111-115`, `src/auth.rs:149-197`, `src/auth.rs:288-338` | Placement goes through these functions. No second copy is written. |
 | `ikigai-secret` gates its read face per name with `urn:cap:secret:read:<name>` and checks it before it consults the keystore. A secret read is never cacheable. | ikigai-secret 0.4.0 `src/lib.rs:36-45`, `src/lib.rs:465-470`, `src/lib.rs:488-504` | Reading a secret's value is the authority the caller must NOT need. |
@@ -257,8 +258,9 @@ authority (CHANGELOG.md, "0.7.0"). With `echo: redact`, each occurrence is repla
 rule, for endpoints whose answers are useful apart from the echoed token.
 
 **Error text.** Every error the door returns passes through the same scrubber, and the
-transport's text in particular. `tests/egress_facts.rs` pins that this text currently carries
-the full URL, query included. The scrubber also covers the scrubbed `Location`, and the
+transport's text in particular. `tests/egress_facts.rs` pins that this text no longer carries
+the URL's query, fragment or userinfo (ledger #3767), but it still carries the rest of what
+the transport said. The scrubber also covers the scrubbed `Location`, and the
 message of any error raised by the shared send path.
 
 A secret shorter than 16 bytes is refused when a rule naming it is created, and again at use

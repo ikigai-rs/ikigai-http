@@ -46,6 +46,8 @@ limitations are recorded below.
   number alone; an origin's error page must not be served as if it were the resource.
 - A denial names what was refused: the method, the host and the path.
 - An error about a credential never repeats the credential.
+- A transport failure names the URL by its scheme, host, port and path, never its query,
+  fragment or userinfo.
 - Meaning is in words, without relying on color, escape sequences or markup. Hosts must decide
   how to safely present interpolated transport errors and origin-supplied values.
 
