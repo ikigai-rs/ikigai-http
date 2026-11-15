@@ -2599,6 +2599,110 @@ mod tests {
         assert_eq!(transport.urls().len(), 2, "304's freshness is used");
     }
 
+    /// Reproduces ledger #2753 against core 0.3.5. Run explicitly with:
+    /// `cargo test unchanged_revalidation_reuses_feed_transforms -- --ignored --nocapture`
+    ///
+    /// Core meets a composite's expiry with its children's deadlines. On expiry it
+    /// invokes the composite before learning that the HTTP dependency is unchanged;
+    /// refreshing the stored HTTP body does not refresh the composite's deadline.
+    /// This needs dependency revalidation in core, not a URL-thread change in HTTP.
+    #[test]
+    #[ignore = "ledger #2753: core reruns expired composites even when their feeds return 304"]
+    fn unchanged_revalidation_reuses_feed_transforms() {
+        const FEEDS: usize = 5;
+        let mut responses = Vec::new();
+        for _ in 0..FEEDS {
+            responses.push(response_with(
+                200,
+                &[("Cache-Control", "max-age=1"), ("ETag", "\"v1\"")],
+                "stored feed",
+            ));
+        }
+        for _ in 0..FEEDS - 1 {
+            responses.push(response_with(304, &[("Cache-Control", "max-age=60")], ""));
+        }
+        responses.push(response_with(
+            200,
+            &[("Cache-Control", "max-age=60"), ("ETag", "\"v2\"")],
+            "changed feed",
+        ));
+        let transport = Seq::new(responses);
+        let runs: Arc<Vec<AtomicU32>> = Arc::new((0..FEEDS).map(|_| AtomicU32::new(0)).collect());
+        let mut routes = endpoints(transport.clone());
+        for index in 0..FEEDS {
+            let counted = Arc::clone(&runs);
+            let transform = ikigai_core::AsyncFnEndpoint::new("transform", move |inv| {
+                let counted = Arc::clone(&counted);
+                Box::pin(async move {
+                    let feed = inv
+                        .issue(get(&format!("https://example.com/feed/{index}")))
+                        .await?;
+                    counted[index].fetch_add(1, Ordering::SeqCst);
+                    Ok(Representation::new(ReprType::new("text/plain"), feed.bytes).cacheable())
+                })
+            });
+            routes = routes.bind(Exact::new(format!("urn:feed:transform:{index}")), transform);
+        }
+        let clock = TestClock::at(0);
+        let kernel = Kernel::new(Arc::new(routes)).with_clock(Arc::new(clock.clone()));
+        let cuts = kernel
+            .listen(
+                ikigai_core::ListenSpec::new().prefix(""),
+                &Capability::root(),
+            )
+            .unwrap();
+        let read = |index| {
+            futures::executor::block_on(kernel.issue(
+                Request::new(
+                    Verb::Source,
+                    Iri::parse(format!("urn:feed:transform:{index}")).unwrap(),
+                ),
+                &Capability::root(),
+            ))
+            .unwrap()
+        };
+        let counts = || {
+            runs.iter()
+                .map(|n| n.load(Ordering::SeqCst))
+                .collect::<Vec<_>>()
+        };
+        for index in 0..FEEDS {
+            assert_eq!(read(index).bytes, b"stored feed");
+            assert_eq!(read(index).bytes, b"stored feed");
+        }
+        assert_eq!(
+            counts(),
+            vec![1; FEEDS],
+            "fresh composites reuse their transforms"
+        );
+        assert_eq!(transport.urls().len(), FEEDS);
+        clock.set(1000);
+        for index in 0..FEEDS {
+            let expected: &[u8] = if index == FEEDS - 1 {
+                b"changed feed"
+            } else {
+                b"stored feed"
+            };
+            assert_eq!(read(index).bytes, expected);
+        }
+        assert_eq!(
+            transport.urls().len(),
+            FEEDS * 2,
+            "every origin was revalidated"
+        );
+        assert!(transport.headers.lock().unwrap()[FEEDS..]
+            .iter()
+            .all(|headers| headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("If-None-Match") && v == "\"v1\"")));
+        assert_eq!(cuts.pending(), 0, "revalidation did not cut any thread");
+        assert_eq!(
+            counts(),
+            vec![1, 1, 1, 1, 2],
+            "only the changed feed should rerun its transform"
+        );
+    }
+
     struct UnreadBody;
     impl futures_io::AsyncRead for UnreadBody {
         fn poll_read(
