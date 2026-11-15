@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.2 (ledger #1869)
+
+Add `base64::encode_url` and `base64::decode_url` for RFC 4648 section 5
+URL-safe base64 without padding. Decoding requires canonical zero unused bits
+and refuses padding, whitespace, and the standard alphabet characters `+` and `/`.
+The existing standard padded helpers and stable error code are unchanged.
+Shared auth vectors cover both profiles.
+
 ## 0.7.1 (ledger #3767)
 
 Security fix: a transport failure no longer repeats the request URL's query,
