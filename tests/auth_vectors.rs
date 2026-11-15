@@ -183,3 +183,41 @@ fn a_built_credential_never_shows_in_debug() {
     let bearer = auth::bearer("mF_9.B5f-4.1JqM").unwrap();
     assert_eq!(format!("{bearer:?}"), "Authorization(Bearer <redacted>)");
 }
+
+#[test]
+fn base64_url_round_trips_every_rfc_vector() {
+    let v = vectors();
+    for case in cases(&v, "base64_url") {
+        let name = s(case, "name");
+        let bytes = bytes_of(case);
+        assert_eq!(
+            base64::encode_url(&bytes),
+            s(case, "encoded"),
+            "{name}: encode"
+        );
+        assert_eq!(
+            base64::decode_url(s(case, "encoded")).ok(),
+            Some(bytes),
+            "{name}: decode"
+        );
+    }
+}
+
+#[test]
+fn base64_url_refuses_every_noncanonical_input_without_echoing_it() {
+    let v = vectors();
+    for case in cases(&v, "base64_url_refusals") {
+        let name = s(case, "name");
+        let input = s(case, "encoded");
+        let err = base64::decode_url(input)
+            .err()
+            .unwrap_or_else(|| panic!("{name}: decoded input it should refuse"));
+        assert_eq!(err.code(), s(case, "error"), "{name}");
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains(input), "{name}: error echoed input");
+        assert!(
+            shown.contains("URL-safe"),
+            "{name}: error names the profile"
+        );
+    }
+}

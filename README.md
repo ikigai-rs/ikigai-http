@@ -237,6 +237,9 @@ assert_eq!(auth::scheme("bearer tok"), Some((auth::Scheme::Bearer, "tok")));
 
 // RFC 4648 base64, standard alphabet, padded, canonical.
 assert_eq!(ikigai_http::base64::encode("foobar"), "Zm9vYmFy");
+// RFC 4648 base64url, URL-safe alphabet, unpadded, canonical.
+assert_eq!(ikigai_http::base64::encode_url([0xfb, 0xff]), "-_8");
+assert_eq!(ikigai_http::base64::decode_url("-_8").unwrap(), [0xfb, 0xff]);
 ```
 
 A built `Authorization` prints as `Authorization(Basic <redacted>)` in `Debug` and

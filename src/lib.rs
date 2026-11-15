@@ -204,7 +204,7 @@
 //! ecosystem's one implementation of a standard every HTTP caller needs (ledger
 //! #1857): [`auth`] builds `Basic` (RFC 7617) and `Bearer` (RFC 6750) header values
 //! and recognizes the scheme of an incoming one, and [`base64`] is RFC 4648 base64
-//! (the vetted `base64` crate behind a two-function face; [`base64`]'s docs say why).
+//! (the vetted `base64` crate behind a small helper API; [`base64`]'s docs say why).
 //! A module calls these rather than formatting a header or encoding by hand.
 //!
 //! ```
