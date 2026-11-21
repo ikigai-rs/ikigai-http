@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## Unreleased (0.8.0, ledger #3899)
+
+Re-pin to `ikigai-core` 0.4.0 (scope opacity, structured denials; the core 0.4.0
+cascade, ledger #3893), and the test-only `ikigai-conformance` to 0.15.0, its release
+on core 0.4.0. A minor bump: the public API now uses core 0.4 types, so a consumer
+still on core 0.3 cannot mix them with this crate. The capability-ACL denial builds
+the new structured `Denial` from the same text. The endpoints behave as before. Under
+core 0.4.0 the kernel never caches a `Timeout` failure (ledger #3869). This covers a
+408, a 504 and a timed-out transport, even though the endpoint still gives them the
+default failure expiry. The test that expected a timed-out transport failure to be
+cached now checks that it is refetched on every read (ledger #3878).
 
 Add `status::response_error_for_status(&response, now, detail)` for callers that
 have already checked that the status is at least 400. It returns `Error` directly

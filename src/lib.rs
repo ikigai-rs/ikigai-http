@@ -238,7 +238,9 @@
 //!   [`DEFAULT_FAILURE_EXPIRY`]; so does a transport failure. The kernel serves the failure
 //!   until then (clamped to its failure ceiling; a cut on the URL drops it), and a composite
 //!   that catches it stays cacheable until then instead of refetching on every read. A 4xx
-//!   other than 429, and a denial, state nothing.
+//!   other than 429, and a denial, state nothing. A `Timeout` (408, 504, a timed-out
+//!   transport) is never cached, whatever it states: since core 0.4.0 the kernel treats a
+//!   wait that ran out as a refusal of this run, not an answer (ledger #3869).
 //!
 //! ```
 //! use ikigai_core::{Error, FailureClass};
@@ -882,11 +884,14 @@ impl Endpoint for HttpEndpoint {
                 current.path(),
             ) {
                 let via = if hops > 0 { "redirect target " } else { "" };
-                return Err(Error::Denied(format!(
-                    "capability does not grant `{}` to {via}`{host}{}`",
-                    self.method.as_str(),
-                    current.path()
-                )));
+                return Err(Error::Denied(
+                    format!(
+                        "capability does not grant `{}` to {via}`{host}{}`",
+                        self.method.as_str(),
+                        current.path()
+                    )
+                    .into(),
+                ));
             }
 
             let target = current.to_string();
@@ -3527,7 +3532,6 @@ mod tests {
             Ok((429, None)),
             Ok((503, Some("in a bit"))),
             Err("connection refused"),
-            Err("error sending request: operation timed out"),
         ] {
             let (kernel, clock, origins) = failing_kernel(answer);
             assert!(read_at(&kernel, &clock, 0, FAILING).is_err());
@@ -3539,6 +3543,28 @@ mod tests {
             );
             assert!(read_at(&kernel, &clock, default, FAILING).is_err());
             assert_eq!(origins.sends(FAILING), 2, "{answer:?}: refetched after it");
+        }
+    }
+
+    #[test]
+    fn a_timeout_is_never_cached_as_a_failure() {
+        // Core 0.4.0 (ledger #3869) never caches a `Timeout`, whatever expiry the
+        // endpoint states: a wait that ran out is a run-context refusal, and a run with
+        // a later deadline must not be served it. Every read asks the origin again.
+        for answer in [
+            Ok((504, None)),
+            Ok((408, Some("30"))),
+            Err("error sending request: operation timed out"),
+        ] {
+            let (kernel, clock, origins) = failing_kernel(answer);
+            let err = read_at(&kernel, &clock, 0, FAILING).unwrap_err();
+            assert!(matches!(err, Error::Timeout(_)), "{answer:?}: {err:?}");
+            assert!(read_at(&kernel, &clock, 1, FAILING).is_err());
+            assert_eq!(
+                origins.sends(FAILING),
+                2,
+                "{answer:?}: recomputes on every read"
+            );
         }
     }
 
