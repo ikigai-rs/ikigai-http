@@ -11,6 +11,23 @@ conditional requests, error bodies, 429) and what it can call (PKCE, OAuth 2 and
 DPoP, HTTP Message Signatures). It should hold for the features that exist, and for which
 features exist at all.
 
+## Decisions (Brian, 2026-11-24)
+
+- **The proposed rules in section 2 are the rules.** For graph resources the PATCH format is
+  SPARQL 1.1 Update (`application/sparql-update`), as section 2 recommends; its exact behavior
+  gets a design of its own.
+- **The mechanism is option (a)** from section 3: hand-written rule vectors plus a behavioral
+  suite over real sockets, with maintained libraries (not our own code) for OAuth 2, OpenID
+  Connect, DPoP and HTTP Message Signatures, each pinned by shared verification vectors.
+- **Placement is as section 4 proposes**, with one change to the daily drift gate: it does not get
+  its own scheduled workflow in the organization's `.github` repository. Scheduled checks live in
+  one place, the ecosystem's existing daily drift scan, because a per-repository schedule goes quiet
+  on inactive repositories. The face `vectors.lock` check joins that scan, and it reports in the
+  scan's own output instead of opening issues.
+- Still open, each with its own item: `Last-Modified`, response compression, and whether the faces
+  serve HTTP as a library feature.
+- The follow-up items in section 5 are filed in the ledger.
+
 ## How this was read
 
 Everything below was read on 2026-11-21 from the `main` branch of public repositories in the
