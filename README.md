@@ -116,10 +116,20 @@ an exact host outranks a glob, a longer suffix outranks a shorter one, and hosts
 compared normalized (case, trailing dot, IDN as punycode). A glob over a public suffix
 (`*.com`) is very broad. The crate docs state the full grammar.
 
+A path is judged twice and must pass both readings: as written, and decoded the way
+an origin may read it (every escape decoded, `\` a separator, dot segments resolved).
+So `example.com` with `-example.com/admin` refuses `/%61dmin`, and an allow on
+`example.com/api` refuses `/api/..%2fadmin`. Only `http` and `https` URLs are sent, on
+the first hop and on every redirect. A caller cannot supply `Host` or a header that
+frames the message (`Connection`, `Content-Length`, `Transfer-Encoding`, `TE`,
+`Trailer`, `Upgrade`, `Keep-Alive`) through `headers=`; each is refused as an invalid
+argument, because the transport sets it from the URL the ACL judged.
+
 The endpoint, not the transport, follows redirects, and only for GET and HEAD,
 re-running the ACL on every hop. Every method that sends a body (POST, PUT, PATCH,
 DELETE, PROPFIND, REPORT) refuses a 3xx with a typed error naming the target, so
-the body is never replayed at an authority the caller did not vet.
+the body is never replayed at an authority the caller did not vet. A redirect error
+names the Location by scheme, host, port and path, never its query or userinfo.
 
 ## Caching (needs `ikigai-core` ≥ 0.1.12)
 

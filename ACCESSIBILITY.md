@@ -47,7 +47,10 @@ limitations are recorded below.
 - A denial names what was refused: the method, the host and the path.
 - An error about a credential never repeats the credential.
 - A transport failure names the URL by its scheme, host, port and path, never its query,
-  fragment or userinfo.
+  fragment or userinfo. A refused or failed redirect names its Location the same way.
+- A refused header or scheme names what was refused and why, in one sentence: "`Host` is
+  set from the URL by the transport and cannot be supplied", "URL scheme `gopher` is not
+  http or https".
 - Meaning is in words, without relying on color, escape sequences or markup. Hosts must decide
   how to safely present interpolated transport errors and origin-supplied values.
 

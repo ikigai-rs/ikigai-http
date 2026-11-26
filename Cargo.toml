@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-http"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Outbound HTTP-client ikigai module: one endpoint per method (urn:http:get…urn:http:delete, plus WebDAV urn:http:propfind and urn:http:report) with the ROC verb mirroring HTTP idempotency, a urn:cap:net host/path-ACL, golden-thread + time-based caching. A cfg-gated backend links into native and wasm32 hosts from one crate."
@@ -24,6 +24,10 @@ futures-io = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["io", "std"] }
 # URL parsing (host/path extraction for the capability ACL); runtime-free.
 url = "2"
+# Percent-decoding for the ACL's second reading of a path (`/%61dmin` is `/admin`).
+# Already in the graph through `url`, so no new copy; `percent_decode_str` and
+# `decode_utf8_lossy` are 2.1's. `^2.1` is `<3`.
+percent-encoding = "2.1"
 # The ecosystem's one base64 (ledger #1857), behind `ikigai_http::base64` so no
 # module hand-rolls its own. 0.22 because it is the line already in the graph of
 # the repos that adopt the helper (ikigai-cli pins `base64 = "0.22"`, ikigai-gonk
