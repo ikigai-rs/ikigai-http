@@ -298,6 +298,10 @@ pub fn transport_error(error: &str, url: &str, detail: impl Into<String>) -> Err
 
 /// `url` as an error may name it: scheme, host, port and path, without its userinfo,
 /// query or fragment.
+pub(crate) fn url_without_secrets(url: &Url) -> String {
+    without_secrets(url)
+}
+
 fn without_secrets(url: &Url) -> String {
     let mut named = url.clone();
     // Both fail only for a URL that cannot carry userinfo, which then has none.

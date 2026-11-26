@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased (0.8.0, ledger #3899)
+## 0.8.1
+
+Fix four places where a request went out, or an error read, differently from what the
+`urn:cap:net` ACL documents:
+
+- A path is now judged twice and must pass both readings: as written, and decoded with
+  `\` as a separator and dot segments resolved. Before, `example.com` with
+  `-example.com/admin` still sent `/%61dmin/users` (the same path, RFC 3986
+  section 6.2.2.2), and an allow on `example.com/api` sent `/api/..%2fadmin`. An
+  encoded slash inside a granted subtree (`/api/v4/projects/group%2Fname`) still goes
+  out.
+- A caller-supplied `Host` header, or one that frames the message (`Connection`,
+  `Content-Length`, `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive`),
+  is refused as `InvalidArgument` on `headers`. Before, `Host` reached the transport
+  and could name a virtual host the ACL never judged.
+- Only `http` and `https` URLs are sent, on the first hop and on every redirect. Before,
+  `gopher:` and `file:` URLs reached the transport, and their unknown default port
+  matched every port-scoped rule.
+- A redirect error (a body-sending method's refused 3xx, too many redirects, an
+  unparsable Location) names the Location by scheme, host, port and path only, never
+  its query or userinfo.
+
+Unchanged: an `https` request redirected to `http` is still followed with credentials
+stripped.
+
+## 0.8.0 (ledger #3899)
 
 Re-pin to `ikigai-core` 0.4.0 (scope opacity, structured denials; the core 0.4.0
 cascade, ledger #3893), and the test-only `ikigai-conformance` to 0.15.0, its release

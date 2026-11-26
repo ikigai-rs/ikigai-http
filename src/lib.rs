@@ -107,6 +107,17 @@
 //! literal in canonical form. The normalization is the URL parser's own (the `url`
 //! crate's WHATWG host parser and IDNA), so a rule means the host a URL resolves to.
 //!
+//! Paths are judged **twice, and must pass both readings**: as written, segment by
+//! segment (`/a%2Fb` is one segment), and as an origin may read it, every escape
+//! decoded, `\` a separator and dot segments resolved, with rule paths read the same
+//! way. So `example.com` + `-example.com/admin` refuses `/%61dmin` (RFC 3986 §6.2.2.2:
+//! the same path) and `example.com/api` refuses `/api/..%2fadmin`.
+//!
+//! The ACL judges the URL, so only `http` and `https` URLs are sent (on every hop), and
+//! a caller cannot supply `Host` or a header that frames the message (`Connection`,
+//! `Content-Length`, `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive`):
+//! each would send the request somewhere the ACL did not judge.
+//!
 //! ### Host globs
 //!
 //! `urn:cap:net:*.<suffix>[:<port>][/<path-prefix>]`, as an allow or a deny
@@ -499,6 +510,63 @@ pub fn net_allows_port(
     port: Option<u16>,
     path: &str,
 ) -> bool {
+    // A path is judged twice, and must pass both: as written (segment by segment, so
+    // `/a%2Fb` is one segment) and as an origin may read it (every escape decoded, a
+    // backslash a separator, dot segments resolved, so `/%61dmin` is `/admin` and
+    // `/api/..%2fadmin` is `/admin`). Rule paths are read the same way on each pass.
+    // RFC 3986 §6.2.2.2 makes `%61` and `a` the same path, and servers differ on
+    // encoded separators, so the ACL takes the stricter answer of the two readings.
+    net_allows_reading(capability, host, port, path, PathReading::Raw)
+        && net_allows_reading(capability, host, port, path, PathReading::Decoded)
+}
+
+/// How [`net_allows_port`] reads a path on one pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathReading {
+    /// Segments as written, escapes left alone.
+    Raw,
+    /// Escapes decoded, `\` a separator, dot segments resolved ([`decoded_segments`]).
+    Decoded,
+}
+
+/// A path's segments as an origin that decodes every escape may read it: decode,
+/// treat `\` as `/` (as WHATWG does for http and https), drop empty and `.`
+/// segments, and let `..` remove the segment before it. Written here rather than
+/// through `Url::join` because the input is DECODED text, where `?`, `#` and `%` are
+/// data the URL parser would reinterpret.
+fn decoded_segments(path: &str) -> Vec<String> {
+    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    let mut segments: Vec<String> = Vec::new();
+    for segment in decoded.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other.to_string()),
+        }
+    }
+    segments
+}
+
+fn path_segments(path: &str, reading: PathReading) -> Vec<String> {
+    match reading {
+        PathReading::Raw => path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        PathReading::Decoded => decoded_segments(path),
+    }
+}
+
+fn net_allows_reading(
+    capability: &ikigai_core::Capability,
+    host: &str,
+    port: Option<u16>,
+    path: &str,
+    reading: PathReading,
+) -> bool {
     if capability.is_root() {
         return true;
     }
@@ -511,6 +579,7 @@ pub fn net_allows_port(
     // host does not parse; such a host matches exact rules by plain comparison and no
     // glob.
     let target = normalize_host(host);
+    let target_segs = path_segments(path, reading);
 
     let mut best: Option<Specificity> = None;
     let mut allowed = false;
@@ -535,7 +604,8 @@ pub fn net_allows_port(
                 return false;
             }
         };
-        let Some(specificity) = parsed.matches(host, target.as_ref(), port, path) else {
+        let Some(specificity) = parsed.matches(host, target.as_ref(), port, &target_segs, reading)
+        else {
             continue;
         };
         match best {
@@ -685,7 +755,8 @@ impl Rule<'_> {
         raw_host: &str,
         target: Option<&NormHost>,
         port: Option<u16>,
-        path: &str,
+        target_segs: &[String],
+        reading: PathReading,
     ) -> Option<Specificity> {
         let host = match &self.host {
             RuleHost::Exact(raw, norm) => {
@@ -716,10 +787,9 @@ impl Rule<'_> {
                 return None;
             }
         }
-        let rule_segs: Vec<&str> = self.path.split('/').filter(|s| !s.is_empty()).collect();
-        let target_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let rule_segs = path_segments(self.path, reading);
         let covered = rule_segs.len() <= target_segs.len()
-            && rule_segs.iter().zip(&target_segs).all(|(r, t)| r == t);
+            && rule_segs.iter().zip(target_segs).all(|(r, t)| r == t);
         covered.then_some(Specificity {
             host,
             rest: self.rest,
@@ -843,6 +913,20 @@ impl Endpoint for HttpEndpoint {
             Vec::new()
         };
         let mut headers = request_headers(inv);
+        // The ACL judges the URL's authority; a header that names another authority or
+        // reframes the message would send the request somewhere it did not judge.
+        if let Some((name, _)) = headers.iter().find(|(name, _)| {
+            ROUTING_HEADERS
+                .iter()
+                .any(|routing| name.eq_ignore_ascii_case(routing))
+        }) {
+            return Err(Error::InvalidArgument {
+                name: "headers".to_string(),
+                detail: format!(
+                    "`{name}` is set from the URL by the transport and cannot be supplied"
+                ),
+            });
+        }
 
         // Only an endpoint-generated condition can validate the offered body.
         let conditional = self.method.is_cacheable()
@@ -868,6 +952,15 @@ impl Endpoint for HttpEndpoint {
         let mut current = parsed.clone();
         let mut hops = 0usize;
         let response = loop {
+            // Only HTTP leaves this module: another scheme has no port the ACL can judge
+            // and is not this transport's to dispatch, on the first hop or a redirect.
+            if !matches!(current.scheme(), "http" | "https") {
+                let what = if hops > 0 { "redirect target" } else { "URL" };
+                return Err(Error::InvalidArgument {
+                    name: "url".to_string(),
+                    detail: format!("{what} scheme `{}` is not http or https", current.scheme()),
+                });
+            }
             let host = current.host_str().ok_or_else(|| Error::InvalidArgument {
                 name: "url".to_string(),
                 detail: "URL has no host".to_string(),
@@ -918,12 +1011,18 @@ impl Endpoint for HttpEndpoint {
             let Some(location) = response.header("location") else {
                 break response; // a 3xx with nowhere to go is just a response
             };
+            // A Location may carry a credential in its query or userinfo (an OAuth
+            // code, a signed URL), so errors name it by scheme, host, port and path.
+            let named = current
+                .join(location)
+                .map(|u| status::url_without_secrets(&u))
+                .unwrap_or_else(|_| "(unparsable)".to_string());
             if self.method.sends_body() {
                 // Never replay a request body at a redirect target — the target
                 // may be a different authority than the one the caller vetted.
                 return Err(Error::Endpoint(format!(
                     "HTTP {} redirect on {} not followed (methods that send a body \
-                     never follow redirects); Location: {location}",
+                     never follow redirects); Location: {named}",
                     response.status,
                     self.method.as_str()
                 )));
@@ -931,12 +1030,12 @@ impl Endpoint for HttpEndpoint {
             hops += 1;
             if hops > MAX_REDIRECTS {
                 return Err(Error::Endpoint(format!(
-                    "too many redirects (limit {MAX_REDIRECTS}) at `{location}`"
+                    "too many redirects (limit {MAX_REDIRECTS}) at `{named}`"
                 )));
             }
-            current = current.join(location).map_err(|e| {
-                Error::Endpoint(format!("invalid redirect Location `{location}`: {e}"))
-            })?;
+            current = current
+                .join(location)
+                .map_err(|e| Error::Endpoint(format!("invalid redirect Location: {e}")))?;
             current.set_fragment(None);
             if current.origin() != parsed.origin() {
                 // Mutate the shared list so credentials stay stripped even if
@@ -1291,6 +1390,20 @@ fn content_type(response: &HttpResponse) -> ReprType {
         None => ReprType::new("application/octet-stream"),
     }
 }
+
+/// Request headers a caller may not supply: `Host` names the authority (a different
+/// virtual host than the one the ACL judged), and the rest frame or reroute the message
+/// on the connection (Fetch's forbidden request-header names for the same reason).
+const ROUTING_HEADERS: [&str; 8] = [
+    "Host",
+    "Connection",
+    "Content-Length",
+    "Transfer-Encoding",
+    "TE",
+    "Trailer",
+    "Upgrade",
+    "Keep-Alive",
+];
 
 /// Build the request headers from the invocation's arguments: a generic
 /// `headers=` block (one `Name: Value` per line) plus convenience args that map to
